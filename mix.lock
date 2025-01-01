@@ -1,0 +1,5 @@
+%{
+  "ex_unit_clustered_case": {:hex, :ex_unit_clustered_case, "0.4.0", "8ab43bee163f929cee471d7198d561d32eab2dc2185e822b9d76c812ad1089d6", [:mix], [], "hexpm", "d7df6421a28fc8c4312d6ffda920d3d6ee06685916bb487573e05443b295f5d0"},
+  "jason": {:hex, :jason, "1.4.4", "b9226785a9aa77b6857ca22832cffa5d5011a667207eb2a0ad56adb5db443b8a", [:mix], [{:decimal, "~> 1.0 or ~> 2.0", [hex: :decimal, repo: "hexpm", optional: true]}], "hexpm", "c5eb0cab91f094599f94d55bc63409236a8ec69a21a67814529e8d5f6cc90b3b"},
+  "uuid": {:hex, :uuid, "1.1.8", "e22fc04499de0de3ed1116b770c7737779f226ceefa0badb3592e64d5cfb4eb9", [:mix], [], "hexpm", "c790593b4c3b601f5dc2378baae7efaf5b3d73c4c6456ba85759905be792f2ac"},
+}
