@@ -1,50 +1,34 @@
 defmodule ElixirRaft.Server.RoleBehaviour do
   @moduledoc """
-  Defines the behavior that all Raft server roles must implement.
-  This includes handling RPCs and timeouts according to the Raft consensus algorithm.
+  Defines the behavior that all Raft roles (Follower, Candidate, Leader) must implement.
+  This ensures consistent handling of events across roles according to the Raft spec.
   """
 
-  alias ElixirRaft.Core.{Term, NodeId}
-   alias ElixirRaft.RPC.Messages.{RequestVote, RequestVoteResponse, AppendEntries, AppendEntriesResponse}
+  alias ElixirRaft.Core.{ServerState}
+  alias ElixirRaft.RPC.Messages.{RequestVote, RequestVoteResponse, AppendEntries, AppendEntriesResponse}
 
-   @type server_role :: :follower | :candidate | :leader
-   @type rpc_message :: RequestVote.t() | RequestVoteResponse.t() | AppendEntries.t() | AppendEntriesResponse.t()
-   @type role_state :: term()
-   @type role_reply :: {:ok, role_state()} | {:transition, server_role(), role_state()}
-   @type timer_type :: :election | :heartbeat
-   @type log_index :: non_neg_integer()
+  @type role_state :: term()
+  @type handler_response :: {:ok, ServerState.t(), role_state()} |
+                           {:transition, atom(), ServerState.t(), role_state()} |
+                           {:error, String.t()}
 
-  @doc """
-  Initializes the role's state.
-  """
-  @callback init(NodeId.t(), Term.t()) :: {:ok, role_state()}
+  @callback init(ServerState.t()) :: {:ok, role_state()}
 
-  @doc """
-  Handles incoming RPC messages.
-  Returns updated state and optionally triggers role transition.
-  """
-  @callback handle_rpc(rpc_message(), role_state()) :: role_reply()
+  @callback handle_append_entries(AppendEntries.t(), ServerState.t(), role_state()) ::
+    handler_response()
 
-  @doc """
-  Handles timer events (election timeout, heartbeat timeout).
-  """
-  @callback handle_timeout(timer_type(), role_state()) :: role_reply()
+  @callback handle_append_entries_response(AppendEntriesResponse.t(), ServerState.t(), role_state()) ::
+    handler_response()
 
-  @doc """
-  Handles client commands (only meaningful for leader).
-  """
-  @callback handle_command(term(), role_state()) ::
-    {:ok, log_index(), role_state()} |
-    {:error, :not_leader, role_state()} |
-    {:transition, server_role(), role_state()}
+  @callback handle_request_vote(RequestVote.t(), ServerState.t(), role_state()) ::
+    handler_response()
 
-  @doc """
-  Returns the current role's type.
-  """
-  @callback role_type() :: server_role()
+  @callback handle_request_vote_response(RequestVoteResponse.t(), ServerState.t(), role_state()) ::
+    handler_response()
 
-  @doc """
-  Returns the timers that should be active for this role.
-  """
-  @callback active_timers() :: [timer_type()]
+  @callback handle_timeout(atom(), ServerState.t(), role_state()) ::
+    handler_response()
+
+  @callback handle_client_command(term(), ServerState.t(), role_state()) ::
+    handler_response()
 end

@@ -1,14 +1,15 @@
 defmodule ElixirRaft.Core.ServerState do
   @moduledoc """
   Manages the core state of a Raft server including:
-  - Current term
-  - Current role (Follower/Candidate/Leader)
-  - Voted for information
-  - Current leader
-  - Vote counting for elections
+  - Term management
+  - Role transitions
+  - Voting
+  - Log management
+  - Leadership tracking
+  - Commit index
   """
 
-  alias ElixirRaft.Core.{Term, NodeId}
+  alias ElixirRaft.Core.{Term, NodeId, LogEntry}
 
   @type role :: :follower | :candidate | :leader
   @type vote_state :: %{
@@ -24,7 +25,9 @@ defmodule ElixirRaft.Core.ServerState do
     voted_for: NodeId.t() | nil,
     current_leader: NodeId.t() | nil,
     vote_state: vote_state() | nil,
-    last_leader_contact: integer() | nil  # Timestamp of last leader contact
+    last_leader_contact: integer() | nil,
+    log: [LogEntry.t()],
+    commit_index: non_neg_integer()
   }
 
   defstruct [
@@ -34,17 +37,20 @@ defmodule ElixirRaft.Core.ServerState do
     :voted_for,
     :current_leader,
     :vote_state,
-    :last_leader_contact
+    :last_leader_contact,
+    log: [],
+    commit_index: 0
   ]
 
   @doc """
-  Creates a new server state initialized as a follower.
+  Creates a new server state with the given node ID.
+  Initializes as follower with term 0.
   """
   @spec new(NodeId.t()) :: t()
   def new(node_id) do
     %__MODULE__{
       node_id: node_id,
-      current_term: Term.new(),
+      current_term: 0,
       role: :follower,
       voted_for: nil,
       current_leader: nil,
@@ -54,11 +60,8 @@ defmodule ElixirRaft.Core.ServerState do
   end
 
   @doc """
-  Updates the term if the new term is greater than the current term.
-  According to Raft, if a server discovers a greater term, it must:
-  1. Update its term
-  2. Convert to follower
-  3. Clear its vote
+  Updates the term if the new term is higher than the current term.
+  When term is updated, server converts to follower and clears vote.
   """
   @spec maybe_update_term(t(), Term.t()) :: {:ok, t()} | {:error, String.t()}
   def maybe_update_term(%__MODULE__{} = state, new_term) do
@@ -77,51 +80,96 @@ defmodule ElixirRaft.Core.ServerState do
   end
 
   @doc """
-  Transitions the server to candidate state and starts a new election.
-  According to Raft:
-  1. Increment current term
-  2. Vote for self
-  3. Reset election timeout
-  4. Send RequestVote RPCs to all other servers
+  Gets a log entry at the specified index.
+  Returns {:ok, entry} if found, {:error, :not_found} if not.
   """
-  @spec become_candidate(t()) :: {:ok, t()} | {:error, String.t()}
-  def become_candidate(%__MODULE__{} = state) do
-    new_term = Term.increment(state.current_term)
+  @spec get_log_entry(t(), non_neg_integer()) :: {:ok, LogEntry.t()} | {:error, :not_found}
+  def get_log_entry(%__MODULE__{log: log}, index) when index > 0 do
+    case Enum.at(log, index - 1) do
+      nil -> {:error, :not_found}
+      entry -> {:ok, entry}
+    end
+  end
 
-    {:ok, %{state |
-      current_term: new_term,
-      role: :candidate,
-      voted_for: state.node_id,
-      current_leader: nil,
-      vote_state: %{
-        term: new_term,
-        votes_received: MapSet.new([state.node_id]),
-        votes_granted: MapSet.new([state.node_id])
-      }
-    }}
+  def get_log_entry(_, _), do: {:error, :not_found}
+
+  @doc """
+  Gets the last log entry.
+  Returns {:ok, entry} if log is not empty, {:error, :not_found} if empty.
+  """
+  @spec get_last_log_entry(t()) :: {:ok, LogEntry.t()} | {:error, :not_found}
+  def get_last_log_entry(%__MODULE__{log: []}), do: {:error, :not_found}
+  def get_last_log_entry(%__MODULE__{log: log}), do: {:ok, List.last(log)}
+
+  @doc """
+  Gets the term of the last log entry, or 0 if log is empty.
+  """
+  @spec get_last_log_term(t()) :: Term.t()
+  def get_last_log_term(%__MODULE__{log: []}) do
+    0
+  end
+  def get_last_log_term(%__MODULE__{log: log}) do
+    last_entry = List.last(log)
+    last_entry.term
   end
 
   @doc """
-  Transitions the server to leader state.
-  According to Raft, this happens when a candidate:
-  1. Receives votes from a majority of servers
-  2. Converts to leader
+  Gets the index of the last log entry, or 0 if log is empty.
   """
-  @spec become_leader(t()) :: {:ok, t()} | {:error, String.t()}
-  def become_leader(%__MODULE__{role: :candidate} = state) do
-    {:ok, %{state |
-      role: :leader,
-      current_leader: state.node_id,
-      vote_state: nil
-    }}
+  @spec get_last_log_index(t()) :: non_neg_integer()
+  def get_last_log_index(%__MODULE__{log: []}), do: 0
+  def get_last_log_index(%__MODULE__{log: log}), do: length(log)
+
+  @doc """
+  Appends entries to the log starting at prev_log_index + 1.
+  If there are existing entries that conflict with the new ones, they are truncated.
+  """
+  @spec append_entries(t(), non_neg_integer(), [LogEntry.t()]) :: {:ok, t()} | {:error, String.t()}
+  def append_entries(%__MODULE__{} = state, prev_log_index, new_entries) do
+    with :ok <- validate_prev_log_index(state, prev_log_index) do
+      # Truncate any conflicting entries and append new ones
+      existing_log = Enum.take(state.log, prev_log_index)
+      new_log = existing_log ++ new_entries
+
+      {:ok, %{state | log: new_log}}
+    end
   end
 
-  def become_leader(%__MODULE__{} = _state) do
-    {:error, "Only candidates can become leader"}
+  @doc """
+  Updates the commit index if the new value is higher than the current one.
+  Will not allow commit index to exceed the last log entry.
+  """
+  @spec update_commit_index(t(), non_neg_integer()) :: {:ok, t()} | {:error, String.t()}
+  def update_commit_index(%__MODULE__{} = state, new_index) do
+    last_index = get_last_log_index(state)
+
+    cond do
+      new_index < state.commit_index ->
+        {:error, "New commit index cannot be lower than current commit index"}
+
+      new_index > last_index ->
+        {:error, "Cannot commit beyond last log entry"}
+
+      true ->
+        {:ok, %{state | commit_index: new_index}}
+    end
+  end
+
+  @doc """
+  Records the vote given by this server to a candidate.
+  """
+  @spec record_vote_for(t(), NodeId.t(), Term.t()) :: {:ok, t()} | {:error, String.t()}
+  def record_vote_for(%__MODULE__{} = state, candidate_id, term) do
+    if term == state.current_term do
+      {:ok, %{state | voted_for: candidate_id}}
+    else
+      {:error, "Vote for different term"}
+    end
   end
 
   @doc """
   Records a vote received from another server during an election.
+  Only valid for candidates.
   """
   @spec record_vote(t(), NodeId.t(), boolean()) :: {:ok, t()} | {:error, String.t()}
   def record_vote(%__MODULE__{role: :candidate} = state, voter_id, granted) do
@@ -144,9 +192,9 @@ defmodule ElixirRaft.Core.ServerState do
   end
 
   @doc """
-  Records contact from a valid leader to reset election timeout.
+  Records contact from a leader, updating the leader ID and timestamp.
   """
-  @spec record_leader_contact(t(), NodeId.t()) :: {:ok, t()} | {:error, String.t()}
+  @spec record_leader_contact(t(), NodeId.t()) :: {:ok, t()}
   def record_leader_contact(%__MODULE__{} = state, leader_id) do
     {:ok, %{state |
       current_leader: leader_id,
@@ -154,24 +202,18 @@ defmodule ElixirRaft.Core.ServerState do
     }}
   end
 
-  @doc """
-  Checks if the server has received enough votes to become leader.
-  """
-  @spec has_quorum?(t(), integer()) :: boolean()
-  def has_quorum?(%__MODULE__{role: :candidate} = state, cluster_size) do
-    votes_needed = div(cluster_size, 2) + 1
-    MapSet.size(state.vote_state.votes_granted) >= votes_needed
-  end
+  # Private Functions
 
-  def has_quorum?(%__MODULE__{}, _), do: false
+  defp validate_prev_log_index(state, prev_log_index) do
+    cond do
+      prev_log_index < 0 ->
+        {:error, "Previous log index cannot be negative"}
 
-  @doc """
-  Returns true if the server hasn't heard from a leader recently.
-  """
-  @spec leader_timed_out?(t(), integer()) :: boolean()
-  def leader_timed_out?(%__MODULE__{last_leader_contact: nil}, _), do: true
-  def leader_timed_out?(%__MODULE__{} = state, timeout_ms) do
-    now = System.monotonic_time(:millisecond)
-    now - state.last_leader_contact >= timeout_ms
+      prev_log_index > get_last_log_index(state) ->
+        {:error, "Previous log index beyond current log"}
+
+      true ->
+        :ok
+    end
   end
 end
