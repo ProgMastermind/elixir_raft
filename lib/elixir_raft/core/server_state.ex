@@ -50,7 +50,7 @@ defmodule ElixirRaft.Core.ServerState do
   def new(node_id) do
     {:ok, %__MODULE__{
         node_id: node_id,
-        current_term: 1,  # Start with term 1 instead of 0
+        current_term: 0,  # Start with term 1 instead of 0
         role: :follower,
         voted_for: nil,
         current_leader: nil,
