@@ -23,7 +23,7 @@ defmodule ElixirRaft.Integration.Phase1.CoreComponentsTest do
     [main_node | other_nodes] = node_ids
 
     # Initialize server state
-    {:ok, server_state} = ServerState.new(main_node)
+    server_state = ServerState.new(main_node)
 
     # Setup cluster configuration
     {:ok, cluster_config} = ClusterConfig.new(node_ids, server_state.current_term)
