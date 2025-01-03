@@ -48,15 +48,15 @@ defmodule ElixirRaft.Core.ServerState do
   """
   @spec new(NodeId.t()) :: t()
   def new(node_id) do
-    %__MODULE__{
-      node_id: node_id,
-      current_term: 0,
-      role: :follower,
-      voted_for: nil,
-      current_leader: nil,
-      vote_state: nil,
-      last_leader_contact: nil
-    }
+    {:ok, %__MODULE__{
+        node_id: node_id,
+        current_term: 1,  # Start with term 1 instead of 0
+        role: :follower,
+        voted_for: nil,
+        current_leader: nil,
+        vote_state: nil,
+        last_leader_contact: nil
+      }}
   end
 
   @doc """
@@ -160,10 +160,15 @@ defmodule ElixirRaft.Core.ServerState do
   """
   @spec record_vote_for(t(), NodeId.t(), Term.t()) :: {:ok, t()} | {:error, String.t()}
   def record_vote_for(%__MODULE__{} = state, candidate_id, term) do
-    if term == state.current_term do
-      {:ok, %{state | voted_for: candidate_id}}
-    else
-      {:error, "Vote for different term"}
+    cond do
+      term != state.current_term ->
+        {:error, "Vote for different term"}
+
+      state.voted_for != nil && state.voted_for != candidate_id ->
+        {:error, "Already voted for different candidate in current term"}
+
+      true ->
+        {:ok, %{state | voted_for: candidate_id}}
     end
   end
 
