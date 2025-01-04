@@ -299,6 +299,7 @@ defmodule ElixirRaft.Network.TcpTransport do
 
         case send_message(socket, encode_handshake(our_node_id)) do
           :ok ->
+          :gen_tcp.controlling_process(socket, parent) # <-- try adding this
             GenServer.cast(parent, {:inbound_connection, socket, remote_node_id})
             {:ok, remote_node_id}
           error ->
