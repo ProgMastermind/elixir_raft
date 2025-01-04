@@ -262,4 +262,87 @@ defmodule ElixirRaft.Server.LeaderTest do
       assert final_server_state.commit_index == 0
     end
   end
+
+  describe "log replication" do
+      test "replicates single entry at a time", context do
+        # Add two entries to the log
+        {:ok, entry1} = LogEntry.new(1, context.server_state.current_term, "test1")
+        {:ok, entry2} = LogEntry.new(2, context.server_state.current_term, "test2")
+        {:ok, server_state} = ServerState.append_entries(context.server_state, 0, [entry1, entry2])
+
+        follower_id = "node_2"
+        # Simulate first successful replication
+        message1 = AppendEntriesResponse.new(
+          server_state.current_term,
+          true,
+          follower_id,
+          1
+        )
+
+        {:ok, _server_state1, leader_state1} =
+          Leader.handle_append_entries_response(message1, server_state, context.leader_state)
+
+        # Verify next_index was updated correctly
+        assert leader_state1.next_index[follower_id] == 2
+        assert leader_state1.match_index[follower_id] == 1
+      end
+
+      test "handles repeated failures by decrementing next_index", context do
+        follower_id = "node_2"
+        # Set initial next_index to 3
+        leader_state = %{context.leader_state |
+          next_index: Map.put(context.leader_state.next_index, follower_id, 3)
+        }
+
+        # Simulate three consecutive failures
+        message = AppendEntriesResponse.new(
+          context.server_state.current_term,
+          false,
+          follower_id,
+          0
+        )
+
+        {:ok, _, leader_state1} =
+          Leader.handle_append_entries_response(message, context.server_state, leader_state)
+        {:ok, _, leader_state2} =
+          Leader.handle_append_entries_response(message, context.server_state, leader_state1)
+
+        # Verify next_index was decremented properly
+        assert leader_state2.next_index[follower_id] == 1
+      end
+    end
+
+    describe "commit index safety" do
+      test "only commits entries from current term", context do
+        # Add entry from previous term
+        {:ok, old_entry} = LogEntry.new(1, context.server_state.current_term - 1, "old")
+        {:ok, server_state1} = ServerState.append_entries(context.server_state, 0, [old_entry])
+
+        # Add entry from current term
+        {:ok, new_entry} = LogEntry.new(2, context.server_state.current_term, "new")
+        {:ok, server_state2} = ServerState.append_entries(server_state1, 1, [new_entry])
+
+        # Simulate majority replication of both entries
+        message1 = AppendEntriesResponse.new(
+          server_state1.current_term,
+          true,
+          "node_2",
+          2
+        )
+        message2 = AppendEntriesResponse.new(
+          server_state2.current_term,
+          true,
+          "node_3",
+          2
+        )
+
+        {:ok, server_state3, leader_state1} =
+          Leader.handle_append_entries_response(message1, server_state2, context.leader_state)
+        {:ok, final_server_state, _} =
+          Leader.handle_append_entries_response(message2, server_state3, leader_state1)
+
+        # Should only commit up to the latest entry from current term
+        assert final_server_state.commit_index == 2
+      end
+    end
 end
