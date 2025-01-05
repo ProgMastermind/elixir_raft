@@ -8,28 +8,27 @@ defmodule ElixirRaft.Consensus.ElectionManager do
   """
 
   use GenServer
-    require Logger
+  require Logger
 
-    alias ElixirRaft.Core.{Term, NodeId}
+  alias ElixirRaft.Core.{Term, NodeId}
 
-    @min_timeout 150
-    @max_timeout 300
-
+  @min_timeout 150
+  @max_timeout 300
 
   defmodule State do
     @moduledoc false
     defstruct [
-      :node_id,
-      :current_term,
-      :voted_for,
+      :node_id,           # NodeId.t()
+      :current_term,      # Term.t()
+      :voted_for,        # NodeId.t() | nil
       :election_timer_ref,
       :election_timeout,
       :cluster_size,
       :quorum_size,
-      votes_received: MapSet.new(),
-      election_state: :follower,  # :follower, :candidate, or :leader
-      leader_id: nil,
-      last_leader_contact: nil
+      votes_received: MapSet.new(),  # MapSet of NodeId.t()
+      election_state: :follower,     # :follower, :candidate, or :leader
+      leader_id: nil,               # NodeId.t() | nil
+      last_leader_contact: nil      # System time in milliseconds
     ]
   end
 
@@ -41,9 +40,11 @@ defmodule ElixirRaft.Consensus.ElectionManager do
   end
 
   @spec record_vote(GenServer.server(), NodeId.t(), boolean(), Term.t()) ::
-    {:ok, :elected | :not_elected} | {:error, term()}
+          {:ok, :elected | :not_elected} | {:error, term()}
   def record_vote(server, voter_id, vote_granted, term) do
-    GenServer.call(server, {:record_vote, voter_id, vote_granted, term})
+    with {:ok, validated_id} <- NodeId.validate(voter_id) do
+      GenServer.call(server, {:record_vote, validated_id, vote_granted, term})
+    end
   end
 
   @spec start_election(GenServer.server()) :: :ok | {:error, term()}
@@ -56,9 +57,11 @@ defmodule ElixirRaft.Consensus.ElectionManager do
     GenServer.cast(server, {:step_down, term})
   end
 
-  @spec record_leader_contact(GenServer.server(), NodeId.t(), Term.t()) :: :ok
+  @spec record_leader_contact(GenServer.server(), NodeId.t(), Term.t()) :: :ok | {:error, term()}
   def record_leader_contact(server, leader_id, term) do
-    GenServer.cast(server, {:leader_contact, leader_id, term})
+    with {:ok, validated_id} <- NodeId.validate(leader_id) do
+      GenServer.cast(server, {:leader_contact, validated_id, term})
+    end
   end
 
   @spec get_leader(GenServer.server()) :: {:ok, NodeId.t() | nil}
@@ -76,11 +79,11 @@ defmodule ElixirRaft.Consensus.ElectionManager do
   @impl true
   def init(opts) do
     with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
+         {:ok, validated_id} <- NodeId.validate(node_id),
          {:ok, cluster_size} <- Keyword.fetch(opts, :cluster_size),
          {:ok, current_term} <- Keyword.fetch(opts, :current_term) do
-
       state = %State{
-        node_id: node_id,
+        node_id: validated_id,
         current_term: current_term,
         voted_for: nil,
         cluster_size: cluster_size,
@@ -91,6 +94,7 @@ defmodule ElixirRaft.Consensus.ElectionManager do
 
       {:ok, schedule_election_timeout(state)}
     else
+      {:error, reason} when is_binary(reason) -> {:stop, reason}
       :error -> {:stop, :missing_required_options}
     end
   end
