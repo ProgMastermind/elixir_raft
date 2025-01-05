@@ -14,7 +14,7 @@ defmodule ElixirRaft.Application do
         config = Application.get_env(:elixir_raft, :node_config, [])
 
         children = [
-          {ElixirRaft.Network.Supervisor, config}
+          # {ElixirRaft.Network.Supervisor, config}
         ]
 
         opts = [strategy: :one_for_one, name: ElixirRaft.Supervisor]

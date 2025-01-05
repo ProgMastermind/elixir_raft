@@ -2,14 +2,21 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   @moduledoc """
   Central message routing and handling component for the Raft consensus protocol.
   Coordinates message flow between network layer and role-specific handlers.
+
+  Responsibilities:
+  - Message routing to appropriate role handlers
+  - Role transitions
+  - Term management
+  - State coordination
   """
 
   use GenServer
   require Logger
 
-  alias ElixirRaft.Core.{ServerState, NodeId}
+  alias ElixirRaft.Core.{ServerState, NodeId, Term}
   alias ElixirRaft.RPC.Messages
   alias ElixirRaft.Server.{Leader, Follower, Candidate}
+  alias ElixirRaft.Storage.{LogStore, StateStore}
 
   @type role_handler :: Leader | Follower | Candidate
   @type dispatch_result ::
@@ -20,12 +27,14 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   defmodule State do
     @moduledoc false
     defstruct [
-      :node_id,
-      :server_state,
-      :current_role,
-      :role_state,
-      :role_handler,
-      :message_handlers
+      :node_id,           # NodeId.t()
+      :server_state,      # ServerState.t()
+      :current_role,      # :follower | :candidate | :leader
+      :role_state,        # Role-specific state
+      :role_handler,      # Module handling current role
+      :state_store,       # StateStore for persistence
+      :log_store,         # LogStore for log entries
+      :message_handlers   # Map of message type to handler functions
     ]
 
     @type t :: %__MODULE__{
@@ -34,6 +43,8 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
       current_role: atom(),
       role_state: term(),
       role_handler: module(),
+      state_store: GenServer.server(),
+      log_store: GenServer.server(),
       message_handlers: map()
     }
   end
@@ -58,7 +69,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   end
 
   @spec transition_to(GenServer.server(), atom()) ::
-    {:ok, term()} | {:error, term()}
+    :ok | {:error, term()}
   def transition_to(server, new_role) do
     if new_role in [:follower, :candidate, :leader] do
       GenServer.call(server, {:transition_to, new_role})
@@ -71,23 +82,12 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
 
   @impl true
   def init(opts) do
-    with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
-         {:ok, validated_node_id} <- NodeId.validate(node_id),
-         {:ok, server_state} <- initialize_server_state(validated_node_id),
-         {:ok, role_state} <- initialize_role_state(:follower, server_state) do
-      state = %State{
-        node_id: validated_node_id,
-        server_state: server_state,
-        current_role: :follower,
-        role_state: role_state,
-        role_handler: Follower,
-        message_handlers: initialize_message_handlers()
-      }
+    with {:ok, state} <- init_state(opts) do
       {:ok, state}
     else
-      {:error, reason} = error ->
+      {:error, reason} ->
         Logger.error("Failed to initialize message dispatcher: #{inspect(reason)}")
-        {:stop, error}
+        {:stop, reason}
     end
   end
 
@@ -104,7 +104,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
       {:transition, new_role, new_server_state, _role_state} ->
         case handle_transition(new_role, new_server_state, state) do
           {:ok, updated_state} ->
-            # When transitioning due to a message, we still need to handle the original message
+            # Re-handle message after transition
             case handle_message(message, updated_state) do
               {:ok, final_server_state, final_role_state, response} ->
                 final_state = %{updated_state |
@@ -115,14 +115,14 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
               _ ->
                 {:reply, {:ok, nil}, updated_state}
             end
-          {:error, reason} = error ->
+          {:error, reason} ->
             Logger.error("Transition failed: #{inspect(reason)}")
-            {:reply, error, state}
+            {:reply, {:error, reason}, state}
         end
 
-      {:error, reason} = error ->
+      {:error, reason} ->
         Logger.error("Message handling failed: #{inspect(reason)}")
-        {:reply, error, state}
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -133,18 +133,90 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   def handle_call({:transition_to, new_role}, _from, state) do
     case handle_transition(new_role, state.server_state, state) do
       {:ok, new_state} -> {:reply, :ok, new_state}
-      {:error, _} = error -> {:reply, error, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
     end
+  end
+
+  @impl true
+  def handle_info({:timeout, type} = msg, state) when type in [:election, :heartbeat] do
+    case state.role_handler.handle_timeout(type, state.server_state, state.role_state) do
+      {:ok, new_server_state, new_role_state} ->
+        {:noreply, %{state |
+          server_state: new_server_state,
+          role_state: new_role_state
+        }}
+
+      {:transition, new_role, new_server_state, _role_state} ->
+        case handle_transition(new_role, new_server_state, state) do
+          {:ok, updated_state} -> {:noreply, updated_state}
+          {:error, reason} ->
+            Logger.error("Transition failed: #{inspect(reason)}")
+            {:noreply, state}
+        end
+
+      {:error, reason} ->
+        Logger.error("Timeout handling failed: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
+
+  def handle_info(msg, state) do
+    Logger.warning("Unexpected message received: #{inspect(msg)}")
+    {:noreply, state}
   end
 
   # Private Functions
 
-  @spec initialize_server_state(NodeId.t()) :: {:ok, ServerState.t()}
+  @spec init_state(keyword()) :: {:ok, State.t()} | {:error, term()}
+  defp init_state(opts) do
+    with {:ok, node_id} <- validate_node_id(opts),
+         {:ok, state_store} <- validate_state_store(opts),
+         {:ok, log_store} <- validate_log_store(opts),
+         {:ok, server_state} <- initialize_server_state(node_id),
+         {:ok, role_state} <- initialize_role_state(:follower, server_state) do
+
+      state = %State{
+        node_id: node_id,
+        server_state: server_state,
+        current_role: :follower,
+        role_state: role_state,
+        role_handler: Follower,
+        state_store: state_store,
+        log_store: log_store,
+        message_handlers: initialize_message_handlers()
+      }
+      {:ok, state}
+    end
+  end
+
+  defp validate_node_id(opts) do
+    with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
+         {:ok, validated_id} <- NodeId.validate(node_id) do
+      {:ok, validated_id}
+    else
+      :error -> {:error, :missing_node_id}
+      error -> error
+    end
+  end
+
+  defp validate_state_store(opts) do
+    case Keyword.fetch(opts, :state_store) do
+      {:ok, store} -> {:ok, store}
+      :error -> {:error, :missing_state_store}
+    end
+  end
+
+  defp validate_log_store(opts) do
+    case Keyword.fetch(opts, :log_store) do
+      {:ok, store} -> {:ok, store}
+      :error -> {:error, :missing_log_store}
+    end
+  end
+
   defp initialize_server_state(node_id) do
     {:ok, ServerState.new(node_id)}
   end
 
-  @spec initialize_role_state(atom(), ServerState.t()) :: {:ok, term()}
   defp initialize_role_state(role, server_state) do
     role_handler = get_role_handler(role)
     role_handler.init(server_state)
@@ -216,16 +288,27 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   end
 
   defp handle_transition(new_role, server_state, state) do
-    with {:ok, new_role_state} <- initialize_role_state(new_role, server_state),
-         new_handler = get_role_handler(new_role) do
+    with {:ok, term_state} <- maybe_increment_term(new_role, server_state, state),
+         :ok <- persist_term(term_state.current_term, state),
+         {:ok, new_role_state} <- initialize_role_state(new_role, term_state) do
       new_state = %{state |
         current_role: new_role,
-        role_handler: new_handler,
+        role_handler: get_role_handler(new_role),
         role_state: new_role_state,
-        server_state: server_state
+        server_state: term_state
       }
       {:ok, new_state}
     end
+  end
+
+  defp maybe_increment_term(:candidate, server_state, _state) do
+    new_term = Term.increment(server_state.current_term)
+    {:ok, %{server_state | current_term: new_term}}
+  end
+  defp maybe_increment_term(_role, server_state, _state), do: {:ok, server_state}
+
+  defp persist_term(term, state) do
+    StateStore.save_term(state.state_store, term)
   end
 
   defp get_role_handler(:follower), do: Follower
