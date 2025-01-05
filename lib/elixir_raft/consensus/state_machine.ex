@@ -252,7 +252,7 @@ defmodule ElixirRaft.Consensus.StateMachine do
     Path.join(state.snapshot_dir, "snapshot_#{index}.dat")
   end
 
-  defp get_term_for_index(index, %{log_store: nil}), do: 0
+  defp get_term_for_index(_index, %{log_store: nil}), do: 0
     defp get_term_for_index(index, %{log_store: log_store}) do
       case LogStore.get_entry(log_store, index) do
         {:ok, entry} -> entry.term
