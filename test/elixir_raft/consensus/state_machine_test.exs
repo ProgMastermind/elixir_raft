@@ -3,10 +3,10 @@ defmodule ElixirRaft.Consensus.StateMachineTest do
   require Logger
 
   alias ElixirRaft.Consensus.StateMachine
-  alias ElixirRaft.Core.LogEntry
+  alias ElixirRaft.Core.{LogEntry, NodeId}
   alias ElixirRaft.Storage.LogStore
 
-  @node_id "node_1"
+  @node_id NodeId.generate()  # Generate a valid UUID for testing
   @temp_dir "test/tmp/state_machine"
 
   setup do
@@ -41,6 +41,18 @@ defmodule ElixirRaft.Consensus.StateMachineTest do
       assert {:ok, state} = StateMachine.get_state(machine)
       assert state == %{}
     end
+
+    test "rejects invalid node_id" do
+      assert {:error, _} = start_supervised({
+        StateMachine,
+        [
+          node_id: "invalid-node-id",
+          log_store: nil,
+          snapshot_dir: @temp_dir,
+          name: :invalid_node_machine
+        ]
+      })
+    end
   end
 
   describe "command application" do
@@ -56,7 +68,6 @@ defmodule ElixirRaft.Consensus.StateMachineTest do
     end
 
     test "applies delete commands", %{state_machine: machine} do
-      # First set some values
       entries = [
         create_entry(1, {:set, :key1, "value1"}),
         create_entry(2, {:delete, :key1})
@@ -96,10 +107,11 @@ defmodule ElixirRaft.Consensus.StateMachineTest do
       snapshot_dir = Path.join(@temp_dir, "snapshots_restore")
       File.mkdir_p!(snapshot_dir)
 
+      other_node_id = NodeId.generate()  # Generate a new valid UUID
       other_machine = start_supervised!(
         {StateMachine,
          [
-           node_id: "node_2",
+           node_id: other_node_id,
            log_store: nil,
            snapshot_dir: snapshot_dir,
            name: :other_machine

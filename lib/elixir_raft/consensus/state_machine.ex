@@ -11,7 +11,7 @@ defmodule ElixirRaft.Consensus.StateMachine do
   use GenServer
   require Logger
 
-  alias ElixirRaft.Core.LogEntry
+  alias ElixirRaft.Core.{LogEntry, NodeId}
   alias ElixirRaft.Storage.LogStore
 
   @type command :: {:set, term(), term()} |
@@ -23,14 +23,14 @@ defmodule ElixirRaft.Consensus.StateMachine do
   defmodule State do
     @moduledoc false
     defstruct [
-      :node_id,
+      :node_id,      # Now NodeId.t()
       :log_store,
       :snapshot_dir,
       :last_applied_index,
       :last_snapshot_index,
       :last_snapshot_term,
-      data: %{},            # Current state data
-      pending_reads: []     # Queued read operations
+      data: %{},
+      pending_reads: []
     ]
   end
 
@@ -74,7 +74,8 @@ defmodule ElixirRaft.Consensus.StateMachine do
 
   @impl true
   def init(opts) do
-    with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
+    with {:ok, raw_node_id} <- Keyword.fetch(opts, :node_id),
+         {:ok, node_id} <- NodeId.validate(raw_node_id),
          {:ok, log_store} <- Keyword.fetch(opts, :log_store),
          {:ok, snapshot_dir} <- Keyword.fetch(opts, :snapshot_dir) do
 
@@ -90,6 +91,7 @@ defmodule ElixirRaft.Consensus.StateMachine do
 
       {:ok, maybe_restore_latest_snapshot(state)}
     else
+      {:error, reason} when is_binary(reason) -> {:stop, {:invalid_node_id, reason}}
       :error -> {:stop, :missing_required_options}
       error -> {:stop, error}
     end
@@ -124,24 +126,23 @@ defmodule ElixirRaft.Consensus.StateMachine do
   end
 
   def handle_call({:restore_snapshot, {index, data} = snapshot}, _from, state) do
-      if valid_snapshot?(snapshot, state) do
-        case write_snapshot(snapshot, state) do
-          :ok ->
-            new_state = %{state |
-              data: data,
-              last_applied_index: index,
-              last_snapshot_index: index,
-              # Don't try to get term from log store if it's nil
-              last_snapshot_term: if(state.log_store, do: get_term_for_index(index, state), else: 0)
-            }
-            {:reply, :ok, new_state}
-          {:error, _} = error ->
-            {:reply, error, state}
-        end
-      else
-        {:reply, {:error, :invalid_snapshot}, state}
+    if valid_snapshot?(snapshot, state) do
+      case write_snapshot(snapshot, state) do
+        :ok ->
+          new_state = %{state |
+            data: data,
+            last_applied_index: index,
+            last_snapshot_index: index,
+            last_snapshot_term: if(state.log_store, do: get_term_for_index(index, state), else: 0)
+          }
+          {:reply, :ok, new_state}
+        {:error, _} = error ->
+          {:reply, error, state}
       end
+    else
+      {:reply, {:error, :invalid_snapshot}, state}
     end
+  end
 
   def handle_call({:query, key}, _from, state) do
     result = Map.get(state.data, key, {:error, :not_found})
@@ -151,29 +152,29 @@ defmodule ElixirRaft.Consensus.StateMachine do
   # Private Functions
 
   defp apply_new_entries(entries, commit_index, state) do
-      with :ok <- validate_entries(entries, state),
-           {:ok, applicable_entries} <- filter_applicable_entries(entries, commit_index, state) do
-        try do
-          new_data = Enum.reduce(applicable_entries, state.data, &apply_entry/2)
-          new_state = %{state |
-            data: new_data,
-            last_applied_index: commit_index
-          }
-          {:ok, new_state}
-        rescue
-          e -> {:error, {:command_application_failed, e}}
-        end
+    with :ok <- validate_entries(entries, state),
+         {:ok, applicable_entries} <- filter_applicable_entries(entries, commit_index, state) do
+      try do
+        new_data = Enum.reduce(applicable_entries, state.data, &apply_entry/2)
+        new_state = %{state |
+          data: new_data,
+          last_applied_index: commit_index
+        }
+        {:ok, new_state}
+      rescue
+        e -> {:error, {:command_application_failed, e}}
       end
     end
+  end
 
   defp filter_applicable_entries(entries, commit_index, state) do
-      applicable = entries
-      |> Enum.filter(&(&1.index > state.last_applied_index))
-      |> Enum.filter(&(&1.index <= commit_index))
-      |> Enum.sort_by(& &1.index)
+    applicable = entries
+    |> Enum.filter(&(&1.index > state.last_applied_index))
+    |> Enum.filter(&(&1.index <= commit_index))
+    |> Enum.sort_by(& &1.index)
 
-      {:ok, applicable}
-    end
+    {:ok, applicable}
+  end
 
   defp validate_entries(entries, state) do
     if Enum.all?(entries, &valid_entry?(&1, state)) do
@@ -187,16 +188,11 @@ defmodule ElixirRaft.Consensus.StateMachine do
     index > state.last_applied_index
   end
 
-  # defp filter_applicable_entries(entries, state) do
-  #   applicable = Enum.filter(entries, &(&1.index > state.last_applied_index))
-  #   {:ok, applicable}
-  # end
-
   defp apply_entry(%LogEntry{command: command}, state_data) do
     case command do
       {:set, key, value} -> Map.put(state_data, key, value)
       {:delete, key} -> Map.delete(state_data, key)
-      {:get, _key} -> state_data  # Read operations don't modify state
+      {:get, _key} -> state_data
       _ -> raise "Unknown command: #{inspect(command)}"
     end
   end
@@ -253,15 +249,12 @@ defmodule ElixirRaft.Consensus.StateMachine do
   end
 
   defp get_term_for_index(_index, %{log_store: nil}), do: 0
-    defp get_term_for_index(index, %{log_store: log_store}) do
-      case LogStore.get_entry(log_store, index) do
-        {:ok, entry} -> entry.term
-        _ -> 0
-      end
+  defp get_term_for_index(index, %{log_store: log_store}) do
+    case LogStore.get_entry(log_store, index) do
+      {:ok, entry} -> entry.term
+      _ -> 0
     end
-
-  defp last_entry_index([]), do: 0
-  defp last_entry_index(entries), do: List.last(entries).index
+  end
 
   defp name_from_opts(opts) do
     case Keyword.get(opts, :name) do
