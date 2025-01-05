@@ -213,8 +213,7 @@ defmodule ElixirRaft.Network.TcpTransport do
     {:noreply, new_state}
   end
 
-  def handle_info({:EXIT, pid, reason}, %{acceptor_pid: pid} = state) do
-    Logger.warn("Acceptor process exited: #{inspect(reason)}")
+  def handle_info({:EXIT, pid, _reason}, %{acceptor_pid: pid} = state) do
     new_acceptor_pid = case state.listen_socket do
       nil -> nil
       socket when is_port(socket) -> start_acceptor(socket, self())

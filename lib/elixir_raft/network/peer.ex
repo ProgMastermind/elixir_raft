@@ -122,8 +122,7 @@ defmodule ElixirRaft.Network.Peer do
     end
   end
 
-  def handle_info({:connection_lost, reason}, state) do
-    Logger.warn("Lost connection to peer #{state.node_id}: #{inspect(reason)}")
+  def handle_info({:connection_lost, _reason}, state) do
     new_state = handle_connection_loss(state)
     {:noreply, new_state}
   end
