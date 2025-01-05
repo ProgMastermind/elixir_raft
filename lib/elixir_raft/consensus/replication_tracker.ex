@@ -22,12 +22,13 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
   defmodule State do
     @moduledoc false
     defstruct [
-      :node_id,           # Current node's ID
+      :node_id,           # Current node's ID (NodeId.t())
       :cluster_size,      # Total number of nodes in cluster
       :current_term,      # Current term
       :last_log_index,    # Index of last log entry
       :commit_index,      # Highest log entry known to be committed
-      progress: %{},      # Map of node_id to progress_info
+      :cluster_nodes,     # List of all node IDs in the cluster
+      progress: %{},      # Map of NodeId.t() to progress_info
       quorum_size: 0      # Number of nodes needed for quorum
     ]
   end
@@ -47,12 +48,22 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
   @spec record_response(GenServer.server(), NodeId.t(), non_neg_integer(), boolean()) ::
     {:ok, :committed | :not_committed} | {:error, term()}
   def record_response(server, node_id, match_index, success) do
-    GenServer.call(server, {:record_response, node_id, match_index, success})
+    case NodeId.validate(node_id) do
+      {:ok, valid_node_id} ->
+        GenServer.call(server, {:record_response, valid_node_id, match_index, success})
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @spec get_next_index(GenServer.server(), NodeId.t()) :: {:ok, pos_integer()} | {:error, term()}
   def get_next_index(server, node_id) do
-    GenServer.call(server, {:get_next_index, node_id})
+    case NodeId.validate(node_id) do
+      {:ok, valid_node_id} ->
+        GenServer.call(server, {:get_next_index, valid_node_id})
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   @spec get_commit_index(GenServer.server()) :: {:ok, non_neg_integer()} | {:error, term()}
@@ -70,23 +81,28 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
   @impl true
   def init(opts) do
     with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
+         {:ok, validated_node_id} <- NodeId.validate(node_id),
          {:ok, cluster_size} <- Keyword.fetch(opts, :cluster_size),
          {:ok, current_term} <- Keyword.fetch(opts, :current_term),
          {:ok, last_log_index} <- Keyword.fetch(opts, :last_log_index) do
 
+      # Get cluster nodes from options or generate them
+      cluster_nodes = Keyword.get(opts, :cluster_nodes) || generate_cluster_nodes(cluster_size)
+
       state = %State{
-        node_id: node_id,
+        node_id: validated_node_id,
         cluster_size: cluster_size,
         current_term: current_term,
         last_log_index: last_log_index,
         commit_index: 0,
+        cluster_nodes: cluster_nodes,
         quorum_size: div(cluster_size, 2) + 1
       }
 
       {:ok, initialize_progress(state)}
     else
+      {:error, reason} -> {:stop, reason}
       :error -> {:stop, :missing_required_options}
-      error -> {:stop, error}
     end
   end
 
@@ -127,7 +143,7 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
   def handle_call({:reset_progress, last_log_index}, _from, state) do
     new_state = %{state |
       last_log_index: last_log_index,
-      progress: initialize_progress_map(state.cluster_size, last_log_index + 1)
+      progress: initialize_progress_map(state.cluster_nodes, last_log_index + 1)
     }
     {:reply, :ok, new_state}
   end
@@ -135,13 +151,13 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
   # Private Functions
 
   defp initialize_progress(%State{} = state) do
-    progress = initialize_progress_map(state.cluster_size, state.last_log_index + 1)
+    progress = initialize_progress_map(state.cluster_nodes, state.last_log_index + 1)
     %{state | progress: progress}
   end
 
-  defp initialize_progress_map(cluster_size, next_index) do
-    1..cluster_size
-    |> Enum.map(fn id -> {"node_#{id}", initial_progress(next_index)} end)
+  defp initialize_progress_map(cluster_nodes, next_index) do
+    cluster_nodes
+    |> Enum.map(fn node_id -> {node_id, initial_progress(next_index)} end)
     |> Map.new()
   end
 
@@ -151,6 +167,10 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
       next_index: next_index,
       last_response: nil
     }
+  end
+
+  defp generate_cluster_nodes(cluster_size) do
+    Enum.map(1..cluster_size, fn _id -> NodeId.generate() end)
   end
 
   defp update_progress(state, node_id, match_index) do
@@ -164,7 +184,6 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
 
       new_state = %{state | progress: new_progress}
 
-      # Check if we can advance commit index
       case check_commitment(new_state, match_index) do
         {:ok, :committed, final_state} -> {:ok, final_state, :committed}
         {:ok, :not_committed, final_state} -> {:ok, final_state, :not_committed}
@@ -184,7 +203,6 @@ defmodule ElixirRaft.Consensus.ReplicationTracker do
 
   defp check_commitment(state, match_index) do
     if match_index > state.commit_index do
-      # Count nodes that have replicated up to match_index
       matching_nodes = count_matching_nodes(state.progress, match_index)
 
       if matching_nodes >= state.quorum_size do
