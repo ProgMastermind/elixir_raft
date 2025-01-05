@@ -1,6 +1,7 @@
 defmodule ElixirRaft.Network.PeerTest do
   use ExUnit.Case, async: true
   alias ElixirRaft.Network.{Peer, TcpTransport}
+  alias ElixirRaft.Core.NodeId
   require Logger
 
   @moduletag :capture_log
@@ -12,11 +13,11 @@ defmodule ElixirRaft.Network.PeerTest do
 
     # Setup transport for peer testing
     transport_name = String.to_atom("transport_#{test_id}")
-    peer_id = "peer_#{test_id}"
+    peer_id = NodeId.generate()
 
     # Start transport
     {:ok, transport} = GenServer.start_link(TcpTransport, [
-      node_id: "node_#{test_id}",
+      node_id: NodeId.generate(),
       name: transport_name
     ], name: transport_name)
 
@@ -46,7 +47,7 @@ defmodule ElixirRaft.Network.PeerTest do
     end
 
     test "fails with invalid configuration", %{transport: transport} do
-      Process.flag(:trap_exit, true)  # Add this line at the start of the test
+      Process.flag(:trap_exit, true)
 
       # Missing node_id
       assert {:error, {:shutdown, {:error, :missing_required_options}}} =
@@ -55,17 +56,25 @@ defmodule ElixirRaft.Network.PeerTest do
           address: {{127, 0, 0, 1}, 9000}
         ])
 
+      # Invalid node_id format
+      assert {:error, {:shutdown, {:error, :invalid_node_id, _}}} =
+        GenServer.start_link(Peer, [
+          node_id: "invalid_uuid",
+          transport: transport,
+          address: {{127, 0, 0, 1}, 9000}
+        ])
+
       # Missing transport
       assert {:error, {:shutdown, {:error, :missing_required_options}}} =
         GenServer.start_link(Peer, [
-          node_id: "test_peer",
+          node_id: NodeId.generate(),
           address: {{127, 0, 0, 1}, 9000}
         ])
 
       # Missing address
       assert {:error, {:shutdown, {:error, :missing_required_options}}} =
         GenServer.start_link(Peer, [
-          node_id: "test_peer",
+          node_id: NodeId.generate(),
           transport: transport
         ])
     end
@@ -79,7 +88,7 @@ defmodule ElixirRaft.Network.PeerTest do
       test_id = System.unique_integer([:positive])
       transport2_name = String.to_atom("transport2_#{test_id}")
       {:ok, transport2} = GenServer.start_link(TcpTransport, [
-        node_id: "remote_#{test_id}",
+        node_id: NodeId.generate(),
         name: transport2_name
       ], name: transport2_name)
 
@@ -137,7 +146,7 @@ defmodule ElixirRaft.Network.PeerTest do
       test_id = System.unique_integer([:positive])
       transport2_name = String.to_atom("transport2_#{test_id}")
       {:ok, transport2} = GenServer.start_link(TcpTransport, [
-        node_id: "remote_#{test_id}",
+        node_id: NodeId.generate(),
         name: transport2_name
       ], name: transport2_name)
 
@@ -183,7 +192,7 @@ defmodule ElixirRaft.Network.PeerTest do
       test_id = System.unique_integer([:positive])
       transport2_name = String.to_atom("transport2_#{test_id}")
       {:ok, transport2} = GenServer.start_link(TcpTransport, [
-        node_id: "remote_#{test_id}",
+        node_id: NodeId.generate(),
         name: transport2_name
       ], name: transport2_name)
 

@@ -1,46 +1,51 @@
 defmodule ElixirRaft.Network.TcpTransportTest do
   use ExUnit.Case, async: true
-    alias ElixirRaft.Network.TcpTransport
-    require Logger
+  alias ElixirRaft.Network.TcpTransport
+  alias ElixirRaft.Core.NodeId
+  require Logger
 
-    @moduletag :capture_log
-    @connection_timeout 1000
-    @message_timeout 2000
-    @setup_delay 100
+  @moduletag :capture_log
+  @connection_timeout 1000
+  @message_timeout 2000
+  @setup_delay 100
 
-    setup do
-      test_id = System.unique_integer([:positive])
+  setup do
+    test_id = System.unique_integer([:positive])
 
-      transport1_name = String.to_atom("transport1_#{test_id}")
-      transport2_name = String.to_atom("transport2_#{test_id}")
+    transport1_name = String.to_atom("transport1_#{test_id}")
+    transport2_name = String.to_atom("transport2_#{test_id}")
 
-      start_opts1 = [
-        node_id: "node_1_#{test_id}",
-        name: transport1_name
-      ]
+    # Generate proper NodeIds instead of strings
+    node1_id = NodeId.generate()
+    node2_id = NodeId.generate()
 
-      start_opts2 = [
-        node_id: "node_2_#{test_id}",
-        name: transport2_name
-      ]
+    start_opts1 = [
+      node_id: node1_id,
+      name: transport1_name
+    ]
 
-      {:ok, pid1} = GenServer.start_link(TcpTransport, start_opts1, name: transport1_name)
-      {:ok, pid2} = GenServer.start_link(TcpTransport, start_opts2, name: transport2_name)
+    start_opts2 = [
+      node_id: node2_id,
+      name: transport2_name
+    ]
 
-      on_exit(fn ->
-        if Process.alive?(pid1), do: GenServer.stop(pid1)
-        if Process.alive?(pid2), do: GenServer.stop(pid2)
-      end)
+    {:ok, pid1} = GenServer.start_link(TcpTransport, start_opts1, name: transport1_name)
+    {:ok, pid2} = GenServer.start_link(TcpTransport, start_opts2, name: transport2_name)
 
-      {:ok, %{
-        transport1: transport1_name,
-        transport2: transport2_name,
-        node1_id: "node_1_#{test_id}",
-        node2_id: "node_2_#{test_id}",
-        pid1: pid1,
-        pid2: pid2
-      }}
-    end
+    on_exit(fn ->
+      if Process.alive?(pid1), do: GenServer.stop(pid1)
+      if Process.alive?(pid2), do: GenServer.stop(pid2)
+    end)
+
+    {:ok, %{
+      transport1: transport1_name,
+      transport2: transport2_name,
+      node1_id: node1_id,
+      node2_id: node2_id,
+      pid1: pid1,
+      pid2: pid2
+    }}
+  end
 
   describe "basic TCP transport" do
     test "can start and listen", %{transport1: transport} do
@@ -49,63 +54,64 @@ defmodule ElixirRaft.Network.TcpTransportTest do
     end
 
     test "can connect and send messages bi-directionally", context do
-        %{
-          transport1: t1,
-          transport2: t2,
-          node1_id: node1_id,
-          node2_id: node2_id
-        } = context
+      %{
+        transport1: t1,
+        transport2: t2,
+        node1_id: node1_id,
+        node2_id: node2_id
+      } = context
 
-        test_pid = self()
+      test_pid = self()
 
-        # Setup message handlers with explicit logging
-        handler1 = fn node_id, msg ->
-          Logger.debug("T1 received message from #{node_id}: #{inspect(msg)}")
-          send(test_pid, {:received_t1, node_id, msg})
-        end
-
-        handler2 = fn node_id, msg ->
-          Logger.debug("T2 received message from #{node_id}: #{inspect(msg)}")
-          send(test_pid, {:received_t2, node_id, msg})
-        end
-
-        :ok = TcpTransport.register_message_handler(t1, handler1)
-        :ok = TcpTransport.register_message_handler(t2, handler2)
-
-        # Start listening on transport1
-        {:ok, {addr, port}} = TcpTransport.listen(t1, [])
-        Process.sleep(@setup_delay)
-
-        # Connect transport2 to transport1
-        {:ok, _socket} = TcpTransport.connect(t2, node1_id, {addr, port}, [])
-
-        # Wait for both sides to be connected
-        assert wait_until(fn ->
-          status1 = TcpTransport.connection_status(t1, node2_id)
-          status2 = TcpTransport.connection_status(t2, node1_id)
-          Logger.debug("Connection status - T1->T2: #{status1}, T2->T1: #{status2}")
-          status1 == :connected && status2 == :connected
-        end) == :ok
-
-        Process.sleep(@setup_delay)
-
-        # Send test messages in both directions
-        Logger.debug("Sending message from T2 to T1")
-        :ok = TcpTransport.send(t2, node1_id, "hello")
-        Process.sleep(50)  # Small delay between sends
-
-        Logger.debug("Sending message from T1 to T2")
-        :ok = TcpTransport.send(t1, node2_id, "world")
-
-        # Wait for and verify both messages
-        assert_receive {:received_t1, ^node2_id, "hello"}, @message_timeout
-        assert_receive {:received_t2, ^node1_id, "world"}, @message_timeout
+      # Setup message handlers with explicit logging
+      handler1 = fn node_id, msg ->
+        Logger.debug("T1 received message from #{inspect(node_id)}: #{inspect(msg)}")
+        send(test_pid, {:received_t1, node_id, msg})
       end
 
+      handler2 = fn node_id, msg ->
+        Logger.debug("T2 received message from #{inspect(node_id)}: #{inspect(msg)}")
+        send(test_pid, {:received_t2, node_id, msg})
+      end
+
+      :ok = TcpTransport.register_message_handler(t1, handler1)
+      :ok = TcpTransport.register_message_handler(t2, handler2)
+
+      # Start listening on transport1
+      {:ok, {addr, port}} = TcpTransport.listen(t1, [])
+      Process.sleep(@setup_delay)
+
+      # Connect transport2 to transport1
+      {:ok, _socket} = TcpTransport.connect(t2, node1_id, {addr, port}, [])
+
+      # Wait for both sides to be connected
+      assert wait_until(fn ->
+        status1 = TcpTransport.connection_status(t1, node2_id)
+        status2 = TcpTransport.connection_status(t2, node1_id)
+        Logger.debug("Connection status - T1->T2: #{status1}, T2->T1: #{status2}")
+        status1 == :connected && status2 == :connected
+      end) == :ok
+
+      Process.sleep(@setup_delay)
+
+      # Send test messages in both directions
+      Logger.debug("Sending message from T2 to T1")
+      :ok = TcpTransport.send(t2, node1_id, "hello")
+      Process.sleep(50)  # Small delay between sends
+
+      Logger.debug("Sending message from T1 to T2")
+      :ok = TcpTransport.send(t1, node2_id, "world")
+
+      # Wait for and verify both messages
+      assert_receive {:received_t1, ^node2_id, "hello"}, @message_timeout
+      assert_receive {:received_t2, ^node1_id, "world"}, @message_timeout
+    end
+
     test "returns error when connecting to non-existent server", %{transport1: transport} do
+      invalid_node_id = NodeId.generate()
       result = TcpTransport.connect(
         transport,
-        "nonexistent_node",
+        invalid_node_id,
         {{127, 0, 0, 1}, 1},
         []
       )

@@ -1,6 +1,7 @@
 defmodule ElixirRaft.Network.TcpTransport do
   use GenServer
   require Logger
+  alias ElixirRaft.Core.NodeId
 
   @behaviour ElixirRaft.Network.TransportBehaviour
 
@@ -12,14 +13,14 @@ defmodule ElixirRaft.Network.TcpTransport do
   defmodule State do
     @moduledoc false
     defstruct [
-      :node_id,
+      :node_id,      # NodeId.t()
       :listen_socket,
       :address,
       :port,
       :message_handler,
       :name,
       :acceptor_pid,
-      connections: %{},           # NodeId -> {socket, metadata}
+      connections: %{},           # NodeId.t() -> {socket, metadata}
     ]
   end
 
@@ -37,21 +38,25 @@ defmodule ElixirRaft.Network.TcpTransport do
   end
 
   @impl ElixirRaft.Network.TransportBehaviour
+  @spec connect(GenServer.server(), NodeId.t(), {:inet.ip_address(), :inet.port_number()}, keyword()) ::
+          {:ok, port()} | {:error, term()}
   def connect(server, node_id, {address, port}, _opts) do
-    GenServer.call(server, {:connect, node_id, address, port}, @connection_timeout)
+    GenServer.call(server, {:connect, NodeId.validate!(node_id), address, port}, @connection_timeout)
   end
 
   @impl ElixirRaft.Network.TransportBehaviour
+  @spec send(GenServer.server(), NodeId.t(), term()) :: :ok | {:error, term()}
   def send(server, node_id, message) do
     case validate_message_size(message) do
-      :ok -> GenServer.call(server, {:send, node_id, message})
+      :ok -> GenServer.call(server, {:send, NodeId.validate!(node_id), message})
       error -> error
     end
   end
 
   @impl ElixirRaft.Network.TransportBehaviour
+  @spec close_connection(GenServer.server(), NodeId.t()) :: :ok
   def close_connection(server, node_id) do
-    GenServer.cast(server, {:close_connection, node_id})
+    GenServer.cast(server, {:close_connection, NodeId.validate!(node_id)})
   end
 
   @impl ElixirRaft.Network.TransportBehaviour
@@ -65,8 +70,9 @@ defmodule ElixirRaft.Network.TcpTransport do
   end
 
   @impl ElixirRaft.Network.TransportBehaviour
+  @spec connection_status(GenServer.server(), NodeId.t()) :: :connected | :disconnected
   def connection_status(server, node_id) do
-    GenServer.call(server, {:connection_status, node_id})
+    GenServer.call(server, {:connection_status, NodeId.validate!(node_id)})
   end
 
   @impl ElixirRaft.Network.TransportBehaviour
@@ -78,8 +84,11 @@ defmodule ElixirRaft.Network.TcpTransport do
 
   @impl true
   def init(opts) do
+    node_id = Keyword.get(opts, :node_id)
+    validated_node_id = NodeId.validate!(node_id)
+
     state = %State{
-      node_id: Keyword.get(opts, :node_id),
+      node_id: validated_node_id,
       name: Keyword.get(opts, :name, __MODULE__)
     }
     {:ok, state}
@@ -299,7 +308,7 @@ defmodule ElixirRaft.Network.TcpTransport do
 
         case send_message(socket, encode_handshake(our_node_id)) do
           :ok ->
-            :gen_tcp.controlling_process(socket, parent) # <-- try adding this
+            :gen_tcp.controlling_process(socket, parent)
             GenServer.cast(parent, {:inbound_connection, socket, remote_node_id})
             {:ok, remote_node_id}
           error ->

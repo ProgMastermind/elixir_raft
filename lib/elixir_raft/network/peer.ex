@@ -20,7 +20,7 @@ defmodule ElixirRaft.Network.Peer do
   defmodule State do
     @moduledoc false
     defstruct [
-      :node_id,           # ID of the peer
+      :node_id,           # NodeId of the peer
       :transport,         # Transport process
       :address,          # {host, port}
       :status,           # :connected | :connecting | :disconnected
@@ -28,6 +28,16 @@ defmodule ElixirRaft.Network.Peer do
       :reconnect_timer,  # Timer reference for reconnection attempts
       :backoff_interval  # Current backoff interval
     ]
+
+    @type t :: %__MODULE__{
+      node_id: NodeId.t(),
+      transport: atom(),
+      address: {tuple(), integer()},
+      status: :connected | :connecting | :disconnected,
+      last_contact: integer() | nil,
+      reconnect_timer: reference() | nil,
+      backoff_interval: integer()
+    }
   end
 
   # Client API
@@ -57,7 +67,8 @@ defmodule ElixirRaft.Network.Peer do
 
   @impl true
   def init(opts) do
-    with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
+    with {:ok, raw_node_id} <- Keyword.fetch(opts, :node_id),
+         {:ok, node_id} <- NodeId.validate(raw_node_id),
          {:ok, transport} <- Keyword.fetch(opts, :transport),
          {:ok, address} <- Keyword.fetch(opts, :address) do
       state = %State{
@@ -69,6 +80,8 @@ defmodule ElixirRaft.Network.Peer do
       }
       {:ok, state}
     else
+      {:error, reason} when is_binary(reason) ->
+        {:stop, {:shutdown, {:error, :invalid_node_id, reason}}}
       :error ->
         {:stop, {:shutdown, {:error, :missing_required_options}}}
     end
@@ -117,6 +130,7 @@ defmodule ElixirRaft.Network.Peer do
 
   # Private Functions
 
+  @spec initiate_connection(State.t()) :: {:ok, State.t()} | {:error, term()}
   defp initiate_connection(state) do
     case TcpTransport.connect(
       state.transport,
@@ -139,6 +153,7 @@ defmodule ElixirRaft.Network.Peer do
     end
   end
 
+  @spec do_disconnect(State.t()) :: State.t()
   defp do_disconnect(state) do
     if state.reconnect_timer, do: Process.cancel_timer(state.reconnect_timer)
 
@@ -153,6 +168,7 @@ defmodule ElixirRaft.Network.Peer do
     }
   end
 
+  @spec handle_connection_loss(State.t()) :: State.t()
   defp handle_connection_loss(state) do
     new_state = %{state |
       status: :disconnected,
@@ -161,6 +177,7 @@ defmodule ElixirRaft.Network.Peer do
     schedule_reconnect(new_state)
   end
 
+  @spec schedule_reconnect(State.t()) :: State.t()
   defp schedule_reconnect(state) do
     if state.reconnect_timer, do: Process.cancel_timer(state.reconnect_timer)
 
