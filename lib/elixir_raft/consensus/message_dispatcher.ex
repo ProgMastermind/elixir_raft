@@ -7,7 +7,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   use GenServer
   require Logger
 
-  alias ElixirRaft.Core.ServerState
+  alias ElixirRaft.Core.{ServerState, NodeId}
   alias ElixirRaft.RPC.Messages
   alias ElixirRaft.Server.{Leader, Follower, Candidate}
 
@@ -27,6 +27,15 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
       :role_handler,
       :message_handlers
     ]
+
+    @type t :: %__MODULE__{
+      node_id: NodeId.t(),
+      server_state: ServerState.t(),
+      current_role: atom(),
+      role_state: term(),
+      role_handler: module(),
+      message_handlers: map()
+    }
   end
 
   # Client API
@@ -63,10 +72,11 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   @impl true
   def init(opts) do
     with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
-         {:ok, server_state} <- initialize_server_state(node_id),
+         {:ok, validated_node_id} <- NodeId.validate(node_id),
+         {:ok, server_state} <- initialize_server_state(validated_node_id),
          {:ok, role_state} <- initialize_role_state(:follower, server_state) do
       state = %State{
-        node_id: node_id,
+        node_id: validated_node_id,
         server_state: server_state,
         current_role: :follower,
         role_state: role_state,
@@ -75,8 +85,8 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
       }
       {:ok, state}
     else
-      error ->
-        Logger.error("Failed to initialize message dispatcher: #{inspect(error)}")
+      {:error, reason} = error ->
+        Logger.error("Failed to initialize message dispatcher: #{inspect(reason)}")
         {:stop, error}
     end
   end
@@ -129,10 +139,12 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
 
   # Private Functions
 
+  @spec initialize_server_state(NodeId.t()) :: {:ok, ServerState.t()}
   defp initialize_server_state(node_id) do
     {:ok, ServerState.new(node_id)}
   end
 
+  @spec initialize_role_state(atom(), ServerState.t()) :: {:ok, term()}
   defp initialize_role_state(role, server_state) do
     role_handler = get_role_handler(role)
     role_handler.init(server_state)

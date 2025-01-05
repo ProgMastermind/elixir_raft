@@ -3,6 +3,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcherTest do
   require Logger
 
   alias ElixirRaft.Consensus.MessageDispatcher
+  alias ElixirRaft.Core.NodeId
   alias ElixirRaft.RPC.Messages.{
     AppendEntries,
     AppendEntriesResponse,
@@ -10,7 +11,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcherTest do
     RequestVoteResponse
   }
 
-  @node_id "node_1"
+  @node_id NodeId.generate()
 
   setup do
     dispatcher = start_supervised!({
@@ -24,13 +25,18 @@ defmodule ElixirRaft.Consensus.MessageDispatcherTest do
     test "starts with follower role", %{dispatcher: dispatcher} do
       assert {:ok, :follower} = MessageDispatcher.get_current_role(dispatcher)
     end
+
+    test "fails with invalid node_id" do
+      assert {:error, _} = MessageDispatcher.start_link(node_id: "invalid-uuid")
+    end
   end
 
   describe "message dispatching" do
     test "handles append entries message", %{dispatcher: dispatcher} do
+      leader_id = NodeId.generate()
       message = %AppendEntries{
         term: 1,
-        leader_id: "leader_1",
+        leader_id: leader_id,
         prev_log_index: 0,
         prev_log_term: 0,
         entries: [],
@@ -43,9 +49,10 @@ defmodule ElixirRaft.Consensus.MessageDispatcherTest do
     end
 
     test "handles request vote message", %{dispatcher: dispatcher} do
+      candidate_id = NodeId.generate()
       message = %RequestVote{
         term: 1,
-        candidate_id: "candidate_1",
+        candidate_id: candidate_id,
         last_log_index: 0,
         last_log_term: 0
       }
@@ -72,9 +79,10 @@ defmodule ElixirRaft.Consensus.MessageDispatcherTest do
       :ok = MessageDispatcher.transition_to(dispatcher, :candidate)
 
       # Receive append entries with higher term
+      leader_id = NodeId.generate()
       message = %AppendEntries{
         term: 2,
-        leader_id: "leader_1",
+        leader_id: leader_id,
         prev_log_index: 0,
         prev_log_term: 0,
         entries: [],
@@ -88,15 +96,13 @@ defmodule ElixirRaft.Consensus.MessageDispatcherTest do
 
   describe "error handling" do
     test "handles role transition errors", %{dispatcher: dispatcher} do
-      assert {:error, _reason} = MessageDispatcher.transition_to(dispatcher, :invalid_role)
+      assert {:error, :invalid_role} = MessageDispatcher.transition_to(dispatcher, :invalid_role)
     end
 
     test "maintains state on handler errors", %{dispatcher: dispatcher} do
       {:ok, initial_role} = MessageDispatcher.get_current_role(dispatcher)
-
       # Trigger error with invalid message
       MessageDispatcher.dispatch_message(dispatcher, :invalid)
-
       assert {:ok, ^initial_role} = MessageDispatcher.get_current_role(dispatcher)
     end
   end
