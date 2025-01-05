@@ -6,12 +6,11 @@ defmodule ElixirRaft.Consensus.CommitManager do
   use GenServer
   require Logger
 
-  alias ElixirRaft.Core.{Term, LogEntry}
+  alias ElixirRaft.Core.{Term, LogEntry, NodeId}
   alias ElixirRaft.Storage.LogStore
 
-  @type server_id :: String.t()
   @type index :: non_neg_integer()
-  @type match_index :: %{server_id() => index()}
+  @type match_index :: %{NodeId.t() => index()}
 
   defmodule State do
     @moduledoc false
@@ -19,7 +18,7 @@ defmodule ElixirRaft.Consensus.CommitManager do
     @type index :: non_neg_integer()
 
     @type t :: %__MODULE__{
-      node_id: String.t(),
+      node_id: NodeId.t(),
       log_store: GenServer.server(),
       commit_index: index(),
       last_applied: index(),
@@ -99,24 +98,23 @@ defmodule ElixirRaft.Consensus.CommitManager do
   end
 
   def handle_call({:update_commit_index, new_index, term}, _from, state) do
-      with :ok <- validate_commit_index(new_index, term, state),
-           {:ok, new_state} <- do_update_commit_index(new_index, state) do
-        case apply_pending_entries(new_state) do
-          {:ok, final_state} ->
-            {:reply, :ok, final_state}
-          {:error, :failed, partial_state} ->
-            # Use the partial state that includes successful applications
-            {:reply, {:error, :failed}, partial_state}
-          {:error, reason} ->
-            Logger.warning("Failed to  update commit index: #{inspect(reason)}", [])
-            {:reply, {:error, reason}, state}
-        end
-      else
-        {:error, reason} = error ->
+    with :ok <- validate_commit_index(new_index, term, state),
+         {:ok, new_state} <- do_update_commit_index(new_index, state) do
+      case apply_pending_entries(new_state) do
+        {:ok, final_state} ->
+          {:reply, :ok, final_state}
+        {:error, :failed, partial_state} ->
+          {:reply, {:error, :failed}, partial_state}
+        {:error, reason} ->
           Logger.warning("Failed to update commit index: #{inspect(reason)}", [])
-          {:reply, error, state}
+          {:reply, {:error, reason}, state}
       end
+    else
+      {:error, reason} = error ->
+        Logger.warning("Failed to update commit index: #{inspect(reason)}", [])
+        {:reply, error, state}
     end
+  end
 
   def handle_call({:advance_commit_index, match_index, term}, _from, state) do
     with {:ok, new_index} <- calculate_commit_index(match_index, term, state),
@@ -133,18 +131,23 @@ defmodule ElixirRaft.Consensus.CommitManager do
   # Private Functions
 
   defp init_state(opts) do
-    node_id = Keyword.fetch!(opts, :node_id)
-    log_store = Keyword.fetch!(opts, :log_store)
-    apply_callback = Keyword.fetch!(opts, :apply_callback)
+    with {:ok, node_id} <- validate_node_id(opts),
+         log_store <- Keyword.fetch!(opts, :log_store),
+         apply_callback <- Keyword.fetch!(opts, :apply_callback) do
+      {:ok, %State{
+        node_id: node_id,
+        log_store: log_store,
+        commit_index: 0,
+        last_applied: 0,
+        pending_commits: [],
+        apply_callback: apply_callback
+      }}
+    end
+  end
 
-    {:ok, %State{
-      node_id: node_id,
-      log_store: log_store,
-      commit_index: 0,
-      last_applied: 0,
-      pending_commits: [],
-      apply_callback: apply_callback
-    }}
+  defp validate_node_id(opts) do
+    node_id = Keyword.fetch!(opts, :node_id)
+    NodeId.validate(node_id)
   end
 
   defp validate_commit_index(new_index, term, state) do
@@ -170,7 +173,7 @@ defmodule ElixirRaft.Consensus.CommitManager do
   defp do_update_commit_index(new_index, state) when new_index > state.commit_index do
     with {:ok, entries} <- LogStore.get_entries(
       state.log_store,
-      state.last_applied + 1,  # Start from last successfully applied
+      state.last_applied + 1,
       new_index
     ) do
       new_pending = Enum.map(entries, fn entry -> {entry.index, entry.term} end)
@@ -211,33 +214,32 @@ defmodule ElixirRaft.Consensus.CommitManager do
   end
 
   defp apply_pending_entries(state) do
-      Enum.reduce_while(state.pending_commits, {:ok, state}, fn {index, _term}, {:ok, acc_state} ->
-        case apply_single_entry(index, acc_state) do
-          {:ok, new_state} ->
-            {:cont, {:ok, new_state}}
-          {:error, _} = _error ->
-            # Important: Return the accumulated state up to the failure
-            {:halt, {:error, :failed, acc_state}}
-        end
-      end)
-    end
+    Enum.reduce_while(state.pending_commits, {:ok, state}, fn {index, _term}, {:ok, acc_state} ->
+      case apply_single_entry(index, acc_state) do
+        {:ok, new_state} ->
+          {:cont, {:ok, new_state}}
+        {:error, _} = _error ->
+          {:halt, {:error, :failed, acc_state}}
+      end
+    end)
+  end
 
   defp apply_single_entry(index, state) do
-      with {:ok, entry} <- LogStore.get_entry(state.log_store, index) do
-        case state.apply_callback.(entry) do
-          :ok ->
-            {:ok, %{state |
-              last_applied: index,
-              pending_commits: Enum.drop_while(
-                state.pending_commits,
-                fn {i, _} -> i <= index end
-              )
-            }}
-          {:error, _} = error ->
-            error
-        end
+    with {:ok, entry} <- LogStore.get_entry(state.log_store, index) do
+      case state.apply_callback.(entry) do
+        :ok ->
+          {:ok, %{state |
+            last_applied: index,
+            pending_commits: Enum.drop_while(
+              state.pending_commits,
+              fn {i, _} -> i <= index end
+            )
+          }}
+        {:error, _} = error ->
+          error
       end
     end
+  end
 
   defp name_from_opts(opts) do
     case Keyword.get(opts, :name) do
