@@ -7,15 +7,18 @@ defmodule ElixirRaft.Application do
 
   @impl true
   def start(_type, _args) do
-    config = Application.get_env(:elixir_raft, :node_config, [])
+      # Don't start supervision tree in test environment
+      if Mix.env() == :test do
+        Supervisor.start_link([], strategy: :one_for_one, name: ElixirRaft.Supervisor)
+      else
+        config = Application.get_env(:elixir_raft, :node_config, [])
 
         children = [
-          # TCP Transport Supervisor
-          {ElixirRaft.Network.TcpTransport.Supervisor, config},
-          # Other supervisors will be added later
+          {ElixirRaft.Network.Supervisor, config}
         ]
 
         opts = [strategy: :one_for_one, name: ElixirRaft.Supervisor]
         Supervisor.start_link(children, opts)
-  end
+      end
+    end
 end

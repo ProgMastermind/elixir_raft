@@ -8,7 +8,7 @@ defmodule ElixirRaft.MixProject do
       elixir: "~> 1.18",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      elixirc_paths: elixirc_paths(Mix.env())
+      # elixirc_paths: elixirc_paths(Mix.env())
     ]
   end
 
@@ -31,7 +31,7 @@ defmodule ElixirRaft.MixProject do
     ]
   end
 
-  defp elixirc_paths(:test), do: ["lib", "test/support"]
-  defp elixirc_paths(_), do: ["lib"]
+  # defp elixirc_paths(:test), do: ["lib", "test/support"]
+  # defp elixirc_paths(_), do: ["lib"]
 
 end

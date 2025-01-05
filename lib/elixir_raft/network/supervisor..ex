@@ -1,4 +1,4 @@
-defmodule ElixirRaft.Network.TcpTransport.Supervisor do
+defmodule ElixirRaft.Network.Supervisor do
   use Supervisor
 
   def start_link(opts) do
@@ -8,7 +8,10 @@ defmodule ElixirRaft.Network.TcpTransport.Supervisor do
   @impl true
   def init(opts) do
     children = [
-      {ElixirRaft.Network.TcpTransport, opts}
+      # TCP Transport and its connections
+            {ElixirRaft.Network.TcpTransport, opts},
+            # Peer management
+            {ElixirRaft.Network.PeerSupervisor, opts}
     ]
 
     Supervisor.init(children, strategy: :one_for_one)
