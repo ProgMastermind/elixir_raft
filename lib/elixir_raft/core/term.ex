@@ -11,6 +11,7 @@ defmodule ElixirRaft.Core.Term do
   """
   @spec new() :: t()
   def new(), do: 0
+  def new(int) when is_integer(int) and int >= 0, do: int
 
   @doc """
   Increments the term by 1.

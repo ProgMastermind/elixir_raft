@@ -2,7 +2,10 @@ defmodule ElixirRaft.Network.TcpTransportTest do
   use ExUnit.Case, async: true
   alias ElixirRaft.Network.TcpTransport
   alias ElixirRaft.Core.NodeId
+  alias ElixirRaft.Core.{LogEntry, Term}
+  alias ElixirRaft.RPC.Messages
   require Logger
+
 
   @moduletag :capture_log
   @connection_timeout 1000
@@ -237,6 +240,105 @@ defmodule ElixirRaft.Network.TcpTransportTest do
       assert {:ok, {^addr, ^port}} = TcpTransport.get_local_address(transport)
     end
   end
+
+
+  describe "message transmission" do
+      test "successfully transmits RequestVote message",
+           %{transport1: t1, transport2: t2, node1_id: n1, node2_id: n2} do
+        {:ok, {address, port}} = TcpTransport.listen(t2, port: 0)
+
+        # Set up message handler on transport2
+        test_pid = self()
+        TcpTransport.register_message_handler(t2, fn from, data ->
+          send(test_pid, {:received, from, data})
+        end)
+
+        {:ok, _socket} = TcpTransport.connect(t1, n2, {address, port}, [])
+
+        # Create and send RequestVote message
+        request_vote = Messages.RequestVote.new(Term.new(), n1, 0, Term.new())
+        encoded_msg = Messages.encode(request_vote)
+
+        :ok = TcpTransport.send(t1, n2, encoded_msg)
+
+        # Verify message received correctly
+        assert_receive {:received, ^n1, received_data}, 1000
+        assert {:ok, decoded_msg} = Messages.decode(received_data)
+        assert decoded_msg == request_vote
+      end
+
+      test "successfully transmits AppendEntries message",
+           %{transport1: t1, transport2: t2, node1_id: n1, node2_id: n2} do
+        {:ok, {address, port}} = TcpTransport.listen(t2, port: 0)
+
+        test_pid = self()
+        TcpTransport.register_message_handler(t2, fn from, data ->
+          send(test_pid, {:received, from, data})
+        end)
+
+        {:ok, _socket} = TcpTransport.connect(t1, n2, {address, port}, [])
+
+        # Create AppendEntries message with some log entries
+        # entries = [
+        #   %LogEntry{term: Term.new(), index: 1, command: "command1"},
+        #   %LogEntry{term: Term.new(), index: 2, command: "command2"}
+        # ]
+        entries = for i <- 1..1000 do
+            %LogEntry{term: Term.new(), index: i, command: "command#{i}"}
+        end
+
+        append_entries = Messages.AppendEntries.new(
+          Term.new(),
+          n1,
+          0,
+          Term.new(),
+          entries,
+          0
+        )
+
+        encoded_msg = Messages.encode(append_entries)
+        :ok = TcpTransport.send(t1, n2, encoded_msg)
+
+        # Verify message received correctly
+        assert_receive {:received, ^n1, received_data}, 1000
+        assert {:ok, decoded_msg} = Messages.decode(received_data)
+        assert decoded_msg == append_entries
+        assert length(decoded_msg.entries) == 1000
+      end
+
+      test "handles message size limits",
+               %{transport1: t1, transport2: t2,  node2_id: n2} do
+            {:ok, {address, port}} = TcpTransport.listen(t2, port: 0)
+            {:ok, _socket} = TcpTransport.connect(t1, n2, {address, port}, [])
+
+            # Create a message that exceeds max size
+            large_data = String.duplicate("x", 2_000_000)
+
+            result = TcpTransport.send(t1, n2, large_data)
+            assert {:error, :message_too_large} = result
+      end
+  end
+
+  describe "connection management" do
+      test "handles disconnection and cleanup",
+           %{transport1: t1, transport2: t2, node1_id: n1, node2_id: n2} do
+        {:ok, {address, port}} = TcpTransport.listen(t2, port: 0)
+        {:ok, _socket} = TcpTransport.connect(t1, n2, {address, port}, [])
+
+        assert :connected == TcpTransport.connection_status(t1, n2)
+
+        # Close connection
+        TcpTransport.close_connection(t1, n2)
+
+        # Give some time for cleanup
+        Process.sleep(100)
+
+        # Verify both sides show disconnected
+        assert :disconnected == TcpTransport.connection_status(t1, n2)
+        assert :disconnected == TcpTransport.connection_status(t2, n1)
+      end
+    end
+
 
   # Helper Functions
 

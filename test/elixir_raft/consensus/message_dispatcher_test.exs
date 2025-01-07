@@ -1,109 +1,155 @@
 defmodule ElixirRaft.Consensus.MessageDispatcherTest do
-  use ExUnit.Case, async: true
-  require Logger
+  use ExUnit.Case, async: false
 
+  alias ElixirRaft.Core.{NodeId, LogEntry}
+  alias ElixirRaft.Storage.{StateStore, LogStore}
+  alias ElixirRaft.RPC.Messages
   alias ElixirRaft.Consensus.MessageDispatcher
-  alias ElixirRaft.Core.NodeId
-  alias ElixirRaft.RPC.Messages.{
-    AppendEntries,
-    AppendEntriesResponse,
-    RequestVote,
-    RequestVoteResponse
-  }
 
-  @node_id NodeId.generate()
+  @moduletag :capture_log
+  @timeout 5000
 
   setup do
-    dispatcher = start_supervised!({
-      MessageDispatcher,
-      [node_id: @node_id]
-    })
-    {:ok, dispatcher: dispatcher}
+    # Create unique test directory
+    test_id = System.unique_integer([:positive])
+    base_dir = System.tmp_dir!()
+    test_dir = Path.join([base_dir, "raft_test_#{test_id}"])
+    File.mkdir_p!(test_dir)
+
+    # Generate node ID
+    node_id = NodeId.generate()
+
+    # Start stores
+    {:ok, state_store} = start_state_store(node_id, test_dir)
+    {:ok, log_store} = start_log_store(test_dir)
+
+    # Start message dispatcher
+    {:ok, dispatcher} = MessageDispatcher.start_link(
+      node_id: node_id,
+      state_store: state_store,
+      log_store: log_store
+    )
+
+    on_exit(fn ->
+      File.rm_rf!(test_dir)
+    end)
+
+    {:ok, %{
+      node_id: node_id,
+      dispatcher: dispatcher,
+      state_store: state_store,
+      log_store: log_store,
+      test_dir: test_dir
+    }}
   end
 
-  describe "initialization" do
-    test "starts with follower role", %{dispatcher: dispatcher} do
-      assert {:ok, :follower} = MessageDispatcher.get_current_role(dispatcher)
-    end
-
-    test "fails with invalid node_id" do
-      assert {:error, _} = MessageDispatcher.start_link(node_id: "invalid-uuid")
-    end
+  test "initialization starts with follower role", %{dispatcher: dispatcher} do
+    assert {:ok, %{role: :follower}} = MessageDispatcher.get_state(dispatcher)
   end
 
-  describe "message dispatching" do
-    test "handles append entries message", %{dispatcher: dispatcher} do
-      leader_id = NodeId.generate()
-      message = %AppendEntries{
-        term: 1,
-        leader_id: leader_id,
-        prev_log_index: 0,
-        prev_log_term: 0,
-        entries: [],
-        leader_commit: 0
-      }
-
-      assert {:ok, response} = MessageDispatcher.dispatch_message(dispatcher, message)
-      assert %AppendEntriesResponse{} = response
-      assert response.term == 1
-    end
-
-    test "handles request vote message", %{dispatcher: dispatcher} do
-      candidate_id = NodeId.generate()
-      message = %RequestVote{
-        term: 1,
-        candidate_id: candidate_id,
-        last_log_index: 0,
-        last_log_term: 0
-      }
-
-      assert {:ok, response} = MessageDispatcher.dispatch_message(dispatcher, message)
-      assert %RequestVoteResponse{} = response
-      assert response.term == 1
-    end
-
-    test "rejects messages with invalid format", %{dispatcher: dispatcher} do
-      assert {:error, :unknown_message_type} =
-        MessageDispatcher.dispatch_message(dispatcher, {:invalid_message})
-    end
+  test "initialization fails with invalid node_id" do
+    assert {:error, _} = MessageDispatcher.start_link(
+      node_id: "invalid",
+      state_store: nil,
+      log_store: nil
+    )
   end
 
-  describe "role transitions" do
-    test "transitions from follower to candidate", %{dispatcher: dispatcher} do
-      assert :ok = MessageDispatcher.transition_to(dispatcher, :candidate)
-      assert {:ok, :candidate} = MessageDispatcher.get_current_role(dispatcher)
-    end
+  test "message dispatching handles append entries message", context do
+    %{dispatcher: dispatcher, node_id: node_id} = context
 
-    test "transitions to follower when receiving higher term", %{dispatcher: dispatcher} do
-      # First become candidate
-      :ok = MessageDispatcher.transition_to(dispatcher, :candidate)
+    # Create append entries message
+    msg = Messages.AppendEntries.new(
+      1, # term
+      "leader-id",
+      0, # prev_log_index
+      0, # prev_log_term
+      [%LogEntry{index: 1, term: 1, command: "test"}],
+      0  # leader_commit
+    )
 
-      # Receive append entries with higher term
-      leader_id = NodeId.generate()
-      message = %AppendEntries{
-        term: 2,
-        leader_id: leader_id,
-        prev_log_index: 0,
-        prev_log_term: 0,
-        entries: [],
-        leader_commit: 0
-      }
+    # Send message
+    :ok = MessageDispatcher.handle_message(dispatcher, msg)
 
-      {:ok, _response} = MessageDispatcher.dispatch_message(dispatcher, message)
-      assert {:ok, :follower} = MessageDispatcher.get_current_role(dispatcher)
-    end
+    # Verify state updated
+    {:ok, state} = MessageDispatcher.get_state(dispatcher)
+    assert state.current_term == 1
   end
 
-  describe "error handling" do
-    test "handles role transition errors", %{dispatcher: dispatcher} do
-      assert {:error, :invalid_role} = MessageDispatcher.transition_to(dispatcher, :invalid_role)
-    end
+  test "message dispatching handles request vote message", context do
+    %{dispatcher: dispatcher, node_id: node_id} = context
 
-    test "maintains state on handler errors", %{dispatcher: dispatcher} do
-      {:ok, initial_role} = MessageDispatcher.get_current_role(dispatcher)
-      # Trigger error with invalid message
-      MessageDispatcher.dispatch_message(dispatcher, :invalid)
-      assert {:ok, ^initial_role} = MessageDispatcher.get_current_role(dispatcher)
-    end
+    msg = Messages.RequestVote.new(
+      1, # term
+      "candidate-id",
+      0, # last_log_index
+      0  # last_log_term
+    )
+
+    :ok = MessageDispatcher.handle_message(dispatcher, msg)
+
+    {:ok, state} = MessageDispatcher.get_state(dispatcher)
+    assert state.current_term == 1
+  end
+
+  test "message dispatching rejects invalid messages", %{dispatcher: dispatcher} do
+    assert {:error, :invalid_message} = MessageDispatcher.handle_message(dispatcher, :invalid)
+  end
+
+  test "role transitions transitions from follower to candidate", context do
+    %{dispatcher: dispatcher} = context
+
+    :ok = MessageDispatcher.transition_to(dispatcher, :candidate)
+
+    {:ok, state} = MessageDispatcher.get_state(dispatcher)
+    assert state.role == :candidate
+  end
+
+  test "role transitions transitions to follower on higher term", context do
+    %{dispatcher: dispatcher} = context
+
+    # First become candidate
+    :ok = MessageDispatcher.transition_to(dispatcher, :candidate)
+
+    # Receive higher term message
+    msg = Messages.AppendEntries.new(5, "leader-id", 0, 0, [], 0)
+    :ok = MessageDispatcher.handle_message(dispatcher, msg)
+
+    {:ok, state} = MessageDispatcher.get_state(dispatcher)
+    assert state.role == :follower
+    assert state.current_term == 5
+  end
+
+  test "error handling handles invalid role transitions", %{dispatcher: dispatcher} do
+    assert {:error, :invalid_transition} = MessageDispatcher.transition_to(dispatcher, :invalid_role)
+  end
+
+  test "error handling maintains state on handler errors", context do
+    %{dispatcher: dispatcher} = context
+
+    {:ok, original_state} = MessageDispatcher.get_state(dispatcher)
+
+    # Try invalid operation
+    MessageDispatcher.handle_message(dispatcher, :invalid)
+
+    {:ok, new_state} = MessageDispatcher.get_state(dispatcher)
+    assert new_state == original_state
+  end
+
+  # Helper functions
+
+  defp start_state_store(node_id, data_dir) do
+    StateStore.start_link(
+      node_id: node_id,
+      data_dir: data_dir,
+      name: :"state_store_#{node_id}"
+    )
+  end
+
+  defp start_log_store(data_dir) do
+    LogStore.start_link(
+      data_dir: data_dir,
+      name: :"log_store_#{data_dir}"
+    )
   end
 end

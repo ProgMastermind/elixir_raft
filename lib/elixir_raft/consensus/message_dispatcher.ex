@@ -93,38 +93,51 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
 
   @impl true
   def handle_call({:dispatch, message}, _from, state) do
-    case handle_message(message, state) do
-      {:ok, new_server_state, new_role_state, response} ->
-        new_state = %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        }
-        {:reply, {:ok, response}, new_state}
+      case handle_message(message, state) do
+        {:ok, new_server_state, new_role_state, response} ->
+          new_state = %{state |
+            server_state: new_server_state,
+            role_state: new_role_state
+          }
+          {:reply, {:ok, response}, new_state}
 
-      {:transition, new_role, new_server_state, _role_state} ->
-        case handle_transition(new_role, new_server_state, state) do
-          {:ok, updated_state} ->
-            # Re-handle message after transition
-            case handle_message(message, updated_state) do
-              {:ok, final_server_state, final_role_state, response} ->
-                final_state = %{updated_state |
-                  server_state: final_server_state,
-                  role_state: final_role_state
-                }
-                {:reply, {:ok, response}, final_state}
-              _ ->
-                {:reply, {:ok, nil}, updated_state}
-            end
-          {:error, reason} ->
-            Logger.error("Transition failed: #{inspect(reason)}")
-            {:reply, {:error, reason}, state}
-        end
+        {:ok, new_server_state, new_role_state} ->  # Add this clause
+          new_state = %{state |
+            server_state: new_server_state,
+            role_state: new_role_state
+          }
+          {:reply, :ok, new_state}
 
-      {:error, reason} ->
-        Logger.error("Message handling failed: #{inspect(reason)}")
-        {:reply, {:error, reason}, state}
+        {:transition, new_role, new_server_state, _role_state} ->
+          case handle_transition(new_role, new_server_state, state) do
+            {:ok, updated_state} ->
+              # Re-handle message after transition
+              case handle_message(message, updated_state) do
+                {:ok, final_server_state, final_role_state, response} ->
+                  final_state = %{updated_state |
+                    server_state: final_server_state,
+                    role_state: final_role_state
+                  }
+                  {:reply, {:ok, response}, final_state}
+                {:ok, final_server_state, final_role_state} ->  # Add this clause
+                  final_state = %{updated_state |
+                    server_state: final_server_state,
+                    role_state: final_role_state
+                  }
+                  {:reply, :ok, final_state}
+                _ ->
+                  {:reply, {:ok, nil}, updated_state}
+              end
+            {:error, reason} ->
+              Logger.error("Transition failed: #{inspect(reason)}")
+              {:reply, {:error, reason}, state}
+          end
+
+        {:error, reason} ->
+          Logger.error("Message handling failed: #{inspect(reason)}")
+          {:reply, {:error, reason}, state}
+      end
     end
-  end
 
   def handle_call(:get_current_role, _from, state) do
     {:reply, {:ok, state.current_role}, state}
@@ -138,7 +151,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   end
 
   @impl true
-  def handle_info({:timeout, type} = msg, state) when type in [:election, :heartbeat] do
+  def handle_info({:timeout, type} = _msg, state) when type in [:election, :heartbeat] do
     case state.role_handler.handle_timeout(type, state.server_state, state.role_state) do
       {:ok, new_server_state, new_role_state} ->
         {:noreply, %{state |
