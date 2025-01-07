@@ -16,7 +16,7 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   alias ElixirRaft.Core.{ServerState, NodeId, Term}
   alias ElixirRaft.RPC.Messages
   alias ElixirRaft.Server.{Leader, Follower, Candidate}
-  alias ElixirRaft.Storage.{LogStore, StateStore}
+  alias ElixirRaft.Storage.{StateStore}
 
   @type role_handler :: Leader | Follower | Candidate
   @type dispatch_result ::
