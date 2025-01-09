@@ -1,69 +1,91 @@
 defmodule ElixirRaft.Server.Candidate do
   @moduledoc """
-  Implementation of the Candidate role in the Raft consensus protocol.
-  A candidate:
-  1. Starts elections to try to become leader
-  2. Sends RequestVote RPCs to other servers
-  3. Collects votes until:
-     - It wins the election and becomes leader
-     - Another server establishes itself as leader
-     - Election timeout occurs
+  Implementation of the Candidate role in Raft.
+  Candidates:
+  - Start elections
+  - Request votes from peers
+  - Track received votes
+  - Transition to leader if majority gained
+  - Step down if leader is discovered
   """
 
   @behaviour ElixirRaft.Server.RoleBehaviour
 
-  alias ElixirRaft.Core.{ServerState, Term}
+  require Logger
+  alias ElixirRaft.Core.{ServerState, Term, NodeId, ClusterInfo}
   alias ElixirRaft.RPC.Messages.{
-    RequestVoteResponse,
-    AppendEntriesResponse
+    AppendEntries,
+    AppendEntriesResponse,
+    RequestVote,
+    RequestVoteResponse
   }
 
   defmodule State do
     @moduledoc false
-
     @type t :: %__MODULE__{
       election_timeout: pos_integer(),
       election_timer_ref: reference() | nil,
-      votes_received: MapSet.t()
+      votes_received: MapSet.t(),
+      election_start: integer()
     }
 
     defstruct [
       :election_timeout,
       :election_timer_ref,
-      :votes_received
+      :election_start,
+      votes_received: MapSet.new()
     ]
   end
 
   @min_timeout 150
   @max_timeout 300
 
+  #
+  # Role Behaviour Implementation
+  #
+
   @impl true
   def init(server_state) do
-    # Start election by incrementing term and voting for self
+    # Start new election
     {:ok, next_term_state} = ServerState.maybe_update_term(
       server_state,
       Term.increment(server_state.current_term)
     )
 
+    # Vote for self
     {:ok, voted_state} = ServerState.record_vote_for(
       next_term_state,
       next_term_state.node_id,
       next_term_state.current_term
     )
 
+    # Initialize candidate state
     state = %State{
       election_timeout: random_timeout(),
-      votes_received: MapSet.new([voted_state.node_id])
+      votes_received: MapSet.new([voted_state.node_id]),
+      election_start: now()
     }
 
-    {:ok, start_election_timer(state)}
+    # Create vote request
+    request = create_vote_request(voted_state)
+
+    # Return state and broadcast request
+    {:ok, voted_state, start_election_timer(state), {:broadcast, request}}
   end
 
   @impl true
   def handle_append_entries(message, server_state, candidate_state) do
-    case Term.compare(message.term, server_state.current_term) do
-      :lt ->
-        # Reject old term
+    case validate_append_entries(message, server_state) do
+      :ok ->
+        # Valid AppendEntries from new leader - step down
+        Logger.info("Stepping down: received valid AppendEntries from leader",
+          term: message.term,
+          leader: message.leader_id
+        )
+        {:transition, :follower, server_state}
+
+      {:error, :old_term} ->
+        # Reject old term messages
         response = AppendEntriesResponse.new(
           server_state.current_term,
           false,
@@ -71,22 +93,28 @@ defmodule ElixirRaft.Server.Candidate do
           0
         )
         {:ok, server_state, candidate_state, response}
-
-      _ ->
-        # Step down for equal or higher term
-        {:transition, :follower, server_state, candidate_state}
     end
+  end
+
+  @impl true
+  def handle_append_entries_response(_message, server_state, candidate_state) do
+    # Candidates don't handle append entries responses
+    {:ok, server_state, candidate_state}
   end
 
   @impl true
   def handle_request_vote(message, server_state, candidate_state) do
     case Term.compare(message.term, server_state.current_term) do
       :gt ->
-        # Step down for higher term
-        {:transition, :follower, server_state, candidate_state}
+        # Higher term - step down
+        Logger.info("Stepping down: received RequestVote with higher term",
+          current_term: server_state.current_term,
+          new_term: message.term
+        )
+        {:transition, :follower, server_state}
 
       _ ->
-        # Reject - already voted for self in current term
+        # Reject - already voted for self
         response = RequestVoteResponse.new(
           server_state.current_term,
           false,
@@ -98,57 +126,38 @@ defmodule ElixirRaft.Server.Candidate do
 
   @impl true
   def handle_request_vote_response(message, server_state, candidate_state) do
-    case Term.compare(message.term, server_state.current_term) do
-      :gt ->
-        # Step down for higher term
-        {:transition, :follower, server_state, candidate_state}
-
-      :eq when message.vote_granted ->
+    case validate_vote_response(message, server_state) do
+      :ok when message.vote_granted ->
         # Record vote and check for majority
-        new_candidate_state = record_vote(candidate_state, message.voter_id)
+        new_state = record_vote(candidate_state, message.voter_id)
 
-        if has_majority?(new_candidate_state) do
-          {:transition, :leader, server_state, new_candidate_state}
+        if has_majority?(new_state) do
+          Logger.info("Won election",
+            term: server_state.current_term,
+            votes: MapSet.size(new_state.votes_received)
+          )
+          {:transition, :leader, server_state}
         else
-          {:ok, server_state, new_candidate_state}
+          {:ok, server_state, new_state}
         end
 
       _ ->
-        # Ignore votes from other terms or rejected votes
+        # Ignore invalid or negative votes
         {:ok, server_state, candidate_state}
     end
   end
 
   @impl true
-  def handle_append_entries_response(_message, server_state, candidate_state) do
-    # Candidates don't handle append entries responses
-    {:ok, server_state, candidate_state}
-  end
-
-  @impl true
-  def handle_timeout(:election, server_state, _candidate_state) do
+  def handle_timeout(:election, server_state, candidate_state) do
+    Logger.info("Election timeout - starting new election",
+      term: server_state.current_term,
+      votes: MapSet.size(candidate_state.votes_received)
+    )
     # Start new election
-    {:ok, next_term_state} = ServerState.maybe_update_term(
-      server_state,
-      Term.increment(server_state.current_term)
-    )
-
-    {:ok, voted_state} = ServerState.record_vote_for(
-      next_term_state,
-      next_term_state.node_id,
-      next_term_state.current_term
-    )
-
-    new_state = %State{
-      election_timeout: random_timeout(),
-      votes_received: MapSet.new([voted_state.node_id])
-    }
-
-    {:ok, voted_state, start_election_timer(new_state)}
+    {:transition, :candidate, server_state}
   end
 
-  @impl true
-  def handle_timeout(_other, server_state, candidate_state) do
+  def handle_timeout(_type, server_state, candidate_state) do
     {:ok, server_state, candidate_state}
   end
 
@@ -157,16 +166,52 @@ defmodule ElixirRaft.Server.Candidate do
     {:error, :no_leader}
   end
 
+  #
   # Private Functions
+  #
+
+  defp validate_append_entries(message, server_state) do
+    case Term.compare(message.term, server_state.current_term) do
+      :lt -> {:error, :old_term}
+      _ -> :ok
+    end
+  end
+
+  defp validate_vote_response(message, server_state) do
+    cond do
+      message.term != server_state.current_term ->
+        {:error, :term_mismatch}
+      server_state.vote_state &&
+      MapSet.member?(server_state.vote_state.votes_received, message.voter_id) ->
+        {:error, :duplicate_vote}
+      true ->
+        :ok
+    end
+  end
+
+  defp create_vote_request(server_state) do
+    RequestVote.new(
+      server_state.current_term,
+      server_state.node_id,
+      ServerState.get_last_log_index(server_state),
+      ServerState.get_last_log_term(server_state)
+    )
+  end
 
   defp record_vote(state, voter_id) do
     %{state | votes_received: MapSet.put(state.votes_received, voter_id)}
   end
 
   defp has_majority?(state) do
-    cluster_size = Application.get_env(:elixir_raft, :cluster_size, 3)
-    votes_needed = div(cluster_size, 2) + 1
-    MapSet.size(state.votes_received) >= votes_needed
+    votes_needed = ClusterInfo.majority_size()
+    current_votes = MapSet.size(state.votes_received)
+
+    Logger.debug("Vote count",
+      current: current_votes,
+      needed: votes_needed
+    )
+
+    current_votes >= votes_needed
   end
 
   defp random_timeout do
@@ -178,4 +223,6 @@ defmodule ElixirRaft.Server.Candidate do
     timer_ref = Process.send_after(self(), {:timeout, :election}, state.election_timeout)
     %{state | election_timer_ref: timer_ref}
   end
+
+  defp now, do: System.monotonic_time(:millisecond)
 end

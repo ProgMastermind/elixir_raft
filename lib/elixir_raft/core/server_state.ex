@@ -155,6 +155,25 @@ defmodule ElixirRaft.Core.ServerState do
     end
   end
 
+
+  @spec get_entries_from(t(), non_neg_integer()) :: {:ok, [LogEntry.t()]}
+  def get_entries_from(%__MODULE__{log: log}, start_index) when start_index > 0 do
+    # Calculate the list index (0-based) from the log index (1-based)
+    list_index = start_index - 1
+
+    # Ensure the list index is within bounds
+    entries =
+      if list_index < length(log) do
+        Enum.slice(log, list_index..-1//1)
+      else
+        []
+      end
+
+    {:ok, entries}
+  end
+
+    def get_entries_from(%__MODULE__{}, _), do: {:ok, []}
+
   @doc """
   Records the vote given by this server to a candidate.
   """

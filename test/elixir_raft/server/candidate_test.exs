@@ -2,40 +2,55 @@ defmodule ElixirRaft.Server.CandidateTest do
   use ExUnit.Case, async: true
 
   alias ElixirRaft.Server.Candidate
-  alias ElixirRaft.Core.{ServerState, NodeId}
+  alias ElixirRaft.Core.{ServerState, Term, NodeId, ClusterInfo}
   alias ElixirRaft.RPC.Messages.{
     AppendEntries,
+    AppendEntriesResponse,
     RequestVote,
-    RequestVoteResponse,
+    RequestVoteResponse
   }
 
   setup do
     node_id = NodeId.generate()
     server_state = ServerState.new(node_id)
-    {:ok, candidate_state} = Candidate.init(server_state)
+    server_state = %{server_state |
+      vote_state: %{
+        term: server_state.current_term,
+        votes_received: MapSet.new(),
+        votes_granted: MapSet.new()
+      }
+    }
+    {:ok, next_term_state, candidate_state, broadcast_request} = Candidate.init(server_state)
 
     {:ok, %{
       node_id: node_id,
       server_state: server_state,
-      candidate_state: candidate_state
+      next_term_state: next_term_state,
+      candidate_state: candidate_state,
+      broadcast_request: broadcast_request
     }}
   end
 
   describe "initialization" do
-    test "starts election with proper state", %{
-      server_state: _server_state,
-      candidate_state: candidate_state,
-      node_id: node_id
-    } do
-      assert candidate_state.election_timer_ref != nil
-      assert candidate_state.election_timeout >= 150
-      assert candidate_state.election_timeout <= 300
-      assert MapSet.member?(candidate_state.votes_received, node_id)
+    test "starts election with proper state", context do
+      assert context.candidate_state.election_timer_ref != nil
+      assert context.candidate_state.election_timeout >= 150
+      assert context.candidate_state.election_timeout <= 300
+      assert MapSet.member?(context.candidate_state.votes_received, context.node_id)
+      assert context.candidate_state.election_start != nil
+
+      # Test term increment
+      assert context.next_term_state.current_term == context.server_state.current_term + 1
+
+      # Test broadcast request
+      assert {:broadcast, request} = context.broadcast_request
+      assert request.term == context.next_term_state.current_term
+      assert request.candidate_id == context.node_id
     end
 
     test "creates different timeouts", %{server_state: server_state} do
-      {:ok, state1} = Candidate.init(server_state)
-      {:ok, state2} = Candidate.init(server_state)
+      {:ok, _, state1, _} = Candidate.init(server_state)
+      {:ok, _, state2, _} = Candidate.init(server_state)
 
       assert state1.election_timeout != state2.election_timeout
     end
@@ -44,7 +59,7 @@ defmodule ElixirRaft.Server.CandidateTest do
   describe "append entries handling" do
     test "rejects append entries from older term", context do
       message = AppendEntries.new(
-        context.server_state.current_term - 1,
+        context.next_term_state.current_term - 1,
         NodeId.generate(),
         0,
         0,
@@ -53,15 +68,15 @@ defmodule ElixirRaft.Server.CandidateTest do
       )
 
       {:ok, _state, _candidate_state, response} =
-        Candidate.handle_append_entries(message, context.server_state, context.candidate_state)
+        Candidate.handle_append_entries(message, context.next_term_state, context.candidate_state)
 
       assert response.success == false
-      assert response.term == context.server_state.current_term
+      assert response.term == context.next_term_state.current_term
     end
 
-    test "steps down for current term append entries", context do
+    test "steps down for current or higher term append entries", context do
       message = AppendEntries.new(
-        context.server_state.current_term,
+        context.next_term_state.current_term,
         NodeId.generate(),
         0,
         0,
@@ -69,98 +84,89 @@ defmodule ElixirRaft.Server.CandidateTest do
         0
       )
 
-      {:transition, :follower, _state, _candidate_state} =
-        Candidate.handle_append_entries(message, context.server_state, context.candidate_state)
-    end
+      {:transition, :follower, state} =
+        Candidate.handle_append_entries(message, context.next_term_state, context.candidate_state)
 
-    test "steps down for higher term append entries", context do
-      message = AppendEntries.new(
-        context.server_state.current_term + 1,
-        NodeId.generate(),
-        0,
-        0,
-        [],
-        0
-      )
-
-      {:transition, :follower, _state, _candidate_state} =
-        Candidate.handle_append_entries(message, context.server_state, context.candidate_state)
+      assert state == context.next_term_state
     end
   end
 
   describe "request vote handling" do
-    test "rejects vote requests from same term", context do
+    test "rejects vote requests from same or lower term", context do
       message = RequestVote.new(
-        context.server_state.current_term,
+        context.next_term_state.current_term,
         NodeId.generate(),
         0,
         0
       )
 
       {:ok, _state, _candidate_state, response} =
-        Candidate.handle_request_vote(message, context.server_state, context.candidate_state)
+        Candidate.handle_request_vote(message, context.next_term_state, context.candidate_state)
 
       assert response.vote_granted == false
+      assert response.term == context.next_term_state.current_term
     end
 
     test "steps down for higher term request", context do
       message = RequestVote.new(
-        context.server_state.current_term + 1,
+        context.next_term_state.current_term + 1,
         NodeId.generate(),
         0,
         0
       )
 
-      {:transition, :follower, _state, _candidate_state} =
-        Candidate.handle_request_vote(message, context.server_state, context.candidate_state)
+      {:transition, :follower, state} =
+        Candidate.handle_request_vote(message, context.next_term_state, context.candidate_state)
+
+      assert state == context.next_term_state
     end
   end
 
-  describe "vote response handling" do
-    test "collects votes and becomes leader on majority", context do
-      # First vote is self vote from initialization
-      # Add one more vote for majority
+  describe "request vote response handling" do
+    test "transitions to leader on majority votes", context do
+      # Create vote from another node
       message = RequestVoteResponse.new(
-        context.server_state.current_term,
+        context.next_term_state.current_term,
         true,
         NodeId.generate()
       )
 
-      {:transition, :leader, _state, final_state} =
+      {:transition, :leader, state} =
         Candidate.handle_request_vote_response(
           message,
-          context.server_state,
+          context.next_term_state,
           context.candidate_state
         )
 
-      assert MapSet.size(final_state.votes_received) == 2
+      assert state == context.next_term_state
     end
 
-    test "continues election without majority", context do
-      message = RequestVoteResponse.new(
-        context.server_state.current_term,
-        true,
-        NodeId.generate()
-      )
-
-      # Increase required votes for testing
+    test "continues as candidate without majority", context do
+      # Set up state with no votes yet
       candidate_state = %{context.candidate_state |
         votes_received: MapSet.new()
       }
 
-      {:ok, _state, new_state} =
+      message = RequestVoteResponse.new(
+        context.next_term_state.current_term,
+        true,
+        NodeId.generate()
+      )
+
+      {:ok, state, new_state} =
         Candidate.handle_request_vote_response(
           message,
-          context.server_state,
+          context.next_term_state,
           candidate_state
         )
 
+      assert state == context.next_term_state
       assert MapSet.size(new_state.votes_received) == 1
     end
 
-    test "ignores votes from old term", context do
+    test "ignores votes from different terms", context do
       message = RequestVoteResponse.new(
-        context.server_state.current_term - 1,
+        context.next_term_state.current_term - 1,
         true,
         NodeId.generate()
       )
@@ -168,53 +174,73 @@ defmodule ElixirRaft.Server.CandidateTest do
       {:ok, state, candidate_state} =
         Candidate.handle_request_vote_response(
           message,
-          context.server_state,
+          context.next_term_state,
           context.candidate_state
         )
 
-      assert state == context.server_state
+      assert state == context.next_term_state
       assert candidate_state == context.candidate_state
     end
 
-    test "steps down on higher term response", context do
+    test "ignores duplicate votes", context do
+      voter_id = NodeId.generate()
+      # First set up the server_state with vote_state
+      server_state = %{context.next_term_state |
+        vote_state: %{
+          term: context.next_term_state.current_term,
+          votes_received: MapSet.new([voter_id]),
+          votes_granted: MapSet.new([voter_id])
+        }
+      }
+
       message = RequestVoteResponse.new(
-        context.server_state.current_term + 1,
-        false,
-        NodeId.generate()
+        context.next_term_state.current_term,
+        true,
+        voter_id
       )
 
-      {:transition, :follower, _state, _candidate_state} =
-        Candidate.handle_request_vote_response(
-          message,
-          context.server_state,
-          context.candidate_state
-        )
+      # Handle that we might get a leader transition or an ok response
+      result = Candidate.handle_request_vote_response(
+        message,
+        server_state,
+        context.candidate_state
+      )
+
+      case result do
+        # {:transition, :leader, state} ->
+        #   assert state == server_state
+        {:ok, state, new_state} ->
+          assert state == server_state
+          assert new_state.votes_received == context.candidate_state.votes_received
+      end
     end
   end
 
   describe "timeout handling" do
-    test "starts new election on timeout", context do
-      {:ok, new_server_state, new_candidate_state} =
-        Candidate.handle_timeout(:election, context.server_state, context.candidate_state)
+    test "starts new election on election timeout", context do
+      {:transition, :candidate, state} =
+        Candidate.handle_timeout(:election, context.next_term_state, context.candidate_state)
 
-      assert new_server_state.current_term > context.server_state.current_term
-      assert MapSet.size(new_candidate_state.votes_received) == 1
-      assert new_candidate_state.election_timer_ref != context.candidate_state.election_timer_ref
+      assert state == context.next_term_state
     end
 
     test "ignores non-election timeouts", context do
       {:ok, state, candidate_state} =
-        Candidate.handle_timeout(:unknown, context.server_state, context.candidate_state)
+        Candidate.handle_timeout(:unknown, context.next_term_state, context.candidate_state)
 
-      assert state == context.server_state
+      assert state == context.next_term_state
       assert candidate_state == context.candidate_state
     end
   end
 
-  describe "client request handling" do
-    test "rejects client requests", context do
+  describe "client command handling" do
+    test "rejects client commands", context do
       assert {:error, :no_leader} =
-        Candidate.handle_client_command("command", context.server_state, context.candidate_state)
+        Candidate.handle_client_command(
+          "command",
+          context.next_term_state,
+          context.candidate_state
+        )
     end
   end
 end

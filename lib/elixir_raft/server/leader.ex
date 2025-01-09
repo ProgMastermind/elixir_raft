@@ -1,75 +1,73 @@
 defmodule ElixirRaft.Server.Leader do
   @moduledoc """
-  Implementation of the Leader role in the Raft consensus protocol.
-
-  Leader responsibilities:
-  1. Handle client requests
-  2. Manage log replication to followers
-  3. Maintain commit index
-  4. Send heartbeats
-  5. Track follower progress
+  Implementation of the Leader role in Raft.
+  Leaders:
+  - Send periodic heartbeats
+  - Manage log replication
+  - Track follower progress
+  - Handle client requests
+  - Step down when discovering higher term
   """
 
   @behaviour ElixirRaft.Server.RoleBehaviour
 
-  alias ElixirRaft.Core.{ServerState, Term, LogEntry}
+  require Logger
+  alias ElixirRaft.Core.{ServerState, Term, NodeId, ClusterInfo, LogEntry}
   alias ElixirRaft.RPC.Messages.{
+    AppendEntries,
     AppendEntriesResponse,
-    RequestVoteResponse,
+    RequestVote,
+    RequestVoteResponse
   }
 
   defmodule State do
     @moduledoc false
-
-    @type follower_progress :: %{
-      next_index: pos_integer(),
-      match_index: non_neg_integer()
-    }
-
     @type t :: %__MODULE__{
-      next_index: %{NodeId.t() => pos_integer()},
+      next_index: %{NodeId.t() => non_neg_integer()},
       match_index: %{NodeId.t() => non_neg_integer()},
       heartbeat_timer_ref: reference() | nil,
-      heartbeat_timeout: pos_integer()
+      heartbeat_interval: pos_integer()
     }
 
     defstruct [
-      :next_index,
-      :match_index,
       :heartbeat_timer_ref,
-      :heartbeat_timeout
+      :heartbeat_interval,
+      next_index: %{},
+      match_index: %{}
     ]
   end
 
   @heartbeat_interval 50  # milliseconds
 
+  #
+  # Role Behaviour Implementation
+  #
+
   @impl true
   def init(server_state) do
-    # Initialize nextIndex for each follower to leader's last log index + 1
-    last_log_index = ServerState.get_last_log_index(server_state)
-    cluster_size = Application.get_env(:elixir_raft, :cluster_size, 3)
+    # Initialize leader state
+    state = initialize_leader_state(server_state)
 
-    # Initialize empty maps for next_index and match_index
-    {next_index, match_index} = initialize_follower_progress(
-      server_state.node_id,
-      cluster_size,
-      last_log_index + 1
-    )
+    # Create initial heartbeat message
+    heartbeat = create_heartbeat(server_state)
 
-    state = %State{
-      next_index: next_index,
-      match_index: match_index,
-      heartbeat_timeout: @heartbeat_interval
-    }
-
-    {:ok, start_heartbeat_timer(state)}
+    # Start heartbeat timer and broadcast initial heartbeat
+    {:ok, server_state, start_heartbeat_timer(state), {:broadcast, heartbeat}}
   end
 
   @impl true
   def handle_append_entries(message, server_state, leader_state) do
     case Term.compare(message.term, server_state.current_term) do
-      :lt ->
-        # Reject old term messages
+      :gt ->
+        # Step down if we see higher term
+        Logger.info("Stepping down: received AppendEntries with higher term",
+          current_term: server_state.current_term,
+          new_term: message.term
+        )
+        {:transition, :follower, server_state}
+
+      _ ->
+        # Reject messages from old/same term (there can't be another leader in our term)
         response = AppendEntriesResponse.new(
           server_state.current_term,
           false,
@@ -77,22 +75,14 @@ defmodule ElixirRaft.Server.Leader do
           0
         )
         {:ok, server_state, leader_state, response}
-
-      _ ->
-        # Step down if we see equal or higher term
-        {:transition, :follower, server_state, leader_state}
     end
   end
 
   @impl true
   def handle_append_entries_response(message, server_state, leader_state) do
-    case Term.compare(message.term, server_state.current_term) do
-      :gt ->
-        # Step down if we see higher term
-        {:transition, :follower, server_state, leader_state}
-
-      _ when message.success ->
-        # Update follower progress on success
+    case validate_append_response(message, server_state) do
+      :ok when message.success ->
+        # Update follower progress
         new_leader_state = update_follower_progress(
           leader_state,
           message.follower_id,
@@ -107,13 +97,18 @@ defmodule ElixirRaft.Server.Leader do
             {:ok, server_state, new_leader_state}
         end
 
-      _ ->
-        # Decrement nextIndex for follower on failure
+      :ok ->
+        # Decrement nextIndex for follower and retry replication immediately
         new_leader_state = decrement_next_index(
           leader_state,
           message.follower_id
         )
-        {:ok, server_state, new_leader_state}
+        append_entries = create_append_entries(server_state, message.follower_id, new_leader_state)
+        {:ok, server_state, new_leader_state, {:send, message.follower_id, append_entries}}
+
+      {:error, :higher_term} ->
+        # Step down if we see higher term
+        {:transition, :follower, server_state}
     end
   end
 
@@ -122,10 +117,14 @@ defmodule ElixirRaft.Server.Leader do
     case Term.compare(message.term, server_state.current_term) do
       :gt ->
         # Step down if we see higher term
-        {:transition, :follower, server_state, leader_state}
+        Logger.info("Stepping down: received RequestVote with higher term",
+          current_term: server_state.current_term,
+          new_term: message.term
+        )
+        {:transition, :follower, server_state}
 
       _ ->
-        # Reject vote request as we're the current leader
+        # Reject vote request (we're the current leader)
         response = RequestVoteResponse.new(
           server_state.current_term,
           false,
@@ -140,7 +139,7 @@ defmodule ElixirRaft.Server.Leader do
     case Term.compare(message.term, server_state.current_term) do
       :gt ->
         # Step down if we see higher term
-        {:transition, :follower, server_state, leader_state}
+        {:transition, :follower, server_state}
       _ ->
         # Ignore vote responses as leader
         {:ok, server_state, leader_state}
@@ -149,13 +148,13 @@ defmodule ElixirRaft.Server.Leader do
 
   @impl true
   def handle_timeout(:heartbeat, server_state, leader_state) do
-    # Send heartbeats to all followers
-    new_leader_state = start_heartbeat_timer(leader_state)
-    {:ok, server_state, new_leader_state}
+    # Create and broadcast heartbeat/append entries to all followers
+    messages = create_append_entries_for_all(server_state, leader_state)
+    new_state = start_heartbeat_timer(leader_state)
+    {:ok, server_state, new_state, {:broadcast_multiple, messages}}
   end
 
-  @impl true
-  def handle_timeout(_other, server_state, leader_state) do
+  def handle_timeout(_type, server_state, leader_state) do
     {:ok, server_state, leader_state}
   end
 
@@ -163,33 +162,88 @@ defmodule ElixirRaft.Server.Leader do
   def handle_client_command(command, server_state, leader_state) do
     # Append entry to local log
     last_index = ServerState.get_last_log_index(server_state)
-    {:ok, entry} = LogEntry.new(
+    new_entry = LogEntry.new!(
       last_index + 1,
       server_state.current_term,
       command
     )
 
-    case ServerState.append_entries(server_state, last_index, [entry]) do
+    case ServerState.append_entries(server_state, last_index, [new_entry]) do
       {:ok, new_server_state} ->
-        {:ok, new_server_state, leader_state}
+        # Immediately try to replicate to followers
+        messages = create_append_entries_for_all(new_server_state, leader_state)
+        {:ok, new_server_state, leader_state, {:broadcast_multiple, messages}}
       {:error, reason} ->
         {:error, reason}
     end
   end
 
+  #
   # Private Functions
+  #
 
-  defp initialize_follower_progress(leader_id, cluster_size, initial_next_index) do
-    # Create a range of follower IDs excluding the leader
-    follower_ids = for i <- 1..cluster_size,
-                      node_id = "node_#{i}",
-                      node_id != leader_id,
-                      do: node_id
+  defp initialize_leader_state(server_state) do
+    last_log_index = ServerState.get_last_log_index(server_state)
+    peers = ClusterInfo.get_peer_ids(server_state.node_id)
 
-    next_index = Map.new(follower_ids, fn id -> {id, initial_next_index} end)
-    match_index = Map.new(follower_ids, fn id -> {id, 0} end)
+    next_index = Map.new(peers, fn peer -> {peer, last_log_index + 1} end)
+    match_index = Map.new(peers, fn peer -> {peer, 0} end)
 
-    {next_index, match_index}
+    %State{
+      heartbeat_interval: @heartbeat_interval,
+      next_index: next_index,
+      match_index: match_index
+    }
+  end
+
+  defp create_heartbeat(server_state) do
+    AppendEntries.heartbeat(
+      server_state.current_term,
+      server_state.node_id,
+      ServerState.get_last_log_index(server_state),
+      ServerState.get_last_log_term(server_state),
+      server_state.commit_index
+    )
+  end
+
+  defp create_append_entries(server_state, follower_id, leader_state) do
+    next_index = Map.get(leader_state.next_index, follower_id)
+    prev_index = next_index - 1
+
+    # Get previous log entry info
+    prev_term = case ServerState.get_log_entry(server_state, prev_index) do
+      {:ok, entry} -> entry.term
+      _ -> 0
+    end
+
+    # Get entries to send
+    entries = case ServerState.get_entries_from(server_state, next_index) do
+      {:ok, entries} -> entries
+      _ -> []
+    end
+
+    AppendEntries.new(
+      server_state.current_term,
+      server_state.node_id,
+      prev_index,
+      prev_term,
+      entries,
+      server_state.commit_index
+    )
+  end
+
+  defp create_append_entries_for_all(server_state, leader_state) do
+    peers = ClusterInfo.get_peer_ids(server_state.node_id)
+    Enum.map(peers, fn peer_id ->
+      {peer_id, create_append_entries(server_state, peer_id, leader_state)}
+    end)
+  end
+
+  defp validate_append_response(message, server_state) do
+    case Term.compare(message.term, server_state.current_term) do
+      :gt -> {:error, :higher_term}
+      _ -> :ok
+    end
   end
 
   defp update_follower_progress(leader_state, follower_id, match_index) do
@@ -208,35 +262,41 @@ defmodule ElixirRaft.Server.Leader do
   end
 
   defp maybe_advance_commit_index(server_state, leader_state) do
-      # Find indexes that have been replicated to a majority
-      match_indexes = Map.values(leader_state.match_index)
-      sorted_indexes = Enum.sort(match_indexes, :desc)
+    match_indexes = Map.values(leader_state.match_index)
+    sorted_indexes = Enum.sort(match_indexes, :desc)
+    majority_size = ClusterInfo.majority_size()
 
-      # Include leader's log in the count (leader always has the entry)
-      majority_needed = div(length(Map.keys(leader_state.match_index)) + 1, 2) + 1
-
-      # Get the highest index with majority replication
-      case Enum.find(sorted_indexes, fn index ->
-        count = Enum.count(match_indexes, &(&1 >= index)) + 1  # +1 for leader
-        count >= majority_needed
-      end) do
-        nil ->
-          {:ok, server_state}
-        index when index > server_state.commit_index ->
-          case ServerState.get_log_entry(server_state, index) do
-            {:ok, entry} when entry.term == server_state.current_term ->
-              ServerState.update_commit_index(server_state, index)
-            _ ->
-              {:ok, server_state}
-          end
-        _ ->
-          {:ok, server_state}
-      end
+    case find_majority_index(sorted_indexes, majority_size) do
+      {:ok, index} when index > server_state.commit_index ->
+        case verify_term_at_index(server_state, index) do
+          {:ok, true} -> ServerState.update_commit_index(server_state, index)
+          _ -> {:ok, server_state}
+        end
+      _ ->
+        {:ok, server_state}
     end
+  end
+
+  defp find_majority_index(sorted_indexes, majority_size) do
+    case Enum.find(sorted_indexes, fn index ->
+      count = Enum.count(sorted_indexes, &(&1 >= index))
+      count >= majority_size
+    end) do
+      nil -> {:error, :no_majority}
+      index -> {:ok, index}
+    end
+  end
+
+  defp verify_term_at_index(server_state, index) do
+    case ServerState.get_log_entry(server_state, index) do
+      {:ok, entry} -> {:ok, entry.term == server_state.current_term}
+      error -> error
+    end
+  end
 
   defp start_heartbeat_timer(%State{} = state) do
     if state.heartbeat_timer_ref, do: Process.cancel_timer(state.heartbeat_timer_ref)
-    timer_ref = Process.send_after(self(), {:timeout, :heartbeat}, state.heartbeat_timeout)
+    timer_ref = Process.send_after(self(), {:timeout, :heartbeat}, state.heartbeat_interval)
     %{state | heartbeat_timer_ref: timer_ref}
   end
 end
