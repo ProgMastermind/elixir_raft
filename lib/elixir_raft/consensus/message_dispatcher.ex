@@ -1,71 +1,77 @@
-defmodule ElixirRaft.Consensus.MessageDispatcher do
+defmodule ElixirRaft.MessageDispatcher do
   @moduledoc """
-  Central coordinator for the Raft consensus protocol.
-  Handles:
+  Handles sending and receiving messages between Raft nodes.
+  Responsibilities:
   - Message routing between nodes
-  - Role-specific message handling
-  - Role transitions
-  - Network communication via TCP
-  - State persistence
-  - Broadcast coordination
+  - Connection management
+  - Message serialization/deserialization
+  - Retry logic for failed sends
+  - Queue management for disconnected peers
   """
 
   use GenServer
   require Logger
 
-  alias ElixirRaft.Core.{ServerState, NodeId, Term}
-  alias ElixirRaft.RPC.Messages
-  alias ElixirRaft.Server.{Leader, Follower, Candidate}
   alias ElixirRaft.Network.TcpTransport
-  alias ElixirRaft.Storage.{StateStore, LogStore}
+  alias ElixirRaft.Core.{NodeId, ClusterInfo}
+  alias ElixirRaft.RPC.Messages
 
   defmodule State do
-    @moduledoc false
     @type t :: %__MODULE__{
       node_id: NodeId.t(),
-      server_state: ServerState.t(),
-      current_role: :follower | :candidate | :leader,
-      role_state: term(),
-      role_handler: module(),
       transport: GenServer.server(),
-      state_store: GenServer.server(),
-      log_store: GenServer.server(),
-      peers: MapSet.t(NodeId.t()),
-      pending_responses: %{reference() => {pid(), term()}},
-      broadcast_queue: :queue.queue()
+      server: pid(),
+      server_name: atom(),
+      pending_messages: %{NodeId.t() => [{reference(), term()}]},
+      retry_timers: %{reference() => reference()},
+      connection_status: %{NodeId.t() => :connected | :disconnected},
+      retry_count: %{reference() => non_neg_integer()}
     }
 
     defstruct [
       :node_id,
-      :server_state,
-      :current_role,
-      :role_state,
-      :role_handler,
       :transport,
-      :state_store,
-      :log_store,
-      peers: MapSet.new(),
-      pending_responses: %{},
-      broadcast_queue: :queue.new()
+      :server,
+      :server_name,
+      pending_messages: %{},
+      retry_timers: %{},
+      connection_status: %{},
+      retry_count: %{}
     ]
   end
+
+  @retry_interval 1000
+  @max_retries 3
 
   # Client API
 
   def start_link(opts) do
-    GenServer.start_link(__MODULE__, opts, name: name_from_opts(opts))
+    name = Keyword.get(opts, :name, __MODULE__)
+    GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  def submit_command(server, command) do
-    GenServer.call(server, {:submit_command, command})
+  def broadcast(server, message) do
+    GenServer.cast(server, {:broadcast, message})
   end
 
-  def get_current_role(server) do
-    GenServer.call(server, :get_current_role)
+  def send_message(server, to_node_id, message) do
+    GenServer.cast(server, {:send, to_node_id, message})
   end
 
-  def get_server_state(server) do
-    GenServer.call(server, :get_server_state)
+  def broadcast_multiple(server, messages) when is_list(messages) do
+    GenServer.cast(server, {:broadcast_multiple, messages})
+  end
+
+  def get_connection_status(server, node_id) do
+    GenServer.call(server, {:get_connection_status, node_id})
+  end
+
+  def connect_peer(server, {node_id, address}) do
+    GenServer.cast(server, {:connect_peer, node_id, address})
+  end
+
+  def disconnect_peer(server, node_id) do
+    GenServer.cast(server, {:disconnect_peer, node_id})
   end
 
   # Server Callbacks
@@ -73,333 +79,227 @@ defmodule ElixirRaft.Consensus.MessageDispatcher do
   @impl true
   def init(opts) do
     with {:ok, state} <- init_state(opts),
-         {:ok, transport} <- init_transport(state),
-         {:ok, state_with_transport} <- {:ok, %{state | transport: transport}},
-         :ok <- start_peer_connections(state_with_transport) do
-      {:ok, state_with_transport}
+         :ok <- setup_transport_handler(state) do
+      {:ok, state}
     else
-      {:error, reason} ->
-        Logger.error("Failed to initialize message dispatcher: #{inspect(reason)}")
-        {:stop, reason}
+      {:error, reason} -> {:stop, reason}
     end
   end
 
   @impl true
-  def handle_call(:get_current_role, _from, state) do
-    {:reply, {:ok, state.current_role}, state}
+  def handle_cast({:broadcast, message}, state) do
+    peers = ClusterInfo.get_peer_ids(state.node_id)
+    encoded_msg = Messages.encode(message)
+
+    Enum.each(peers, fn peer_id ->
+      do_send_message(peer_id, encoded_msg, state)
+    end)
+
+    {:noreply, state}
   end
 
-  def handle_call(:get_server_state, _from, state) do
-    {:reply, {:ok, state.server_state}, state}
+  def handle_cast({:send, to_node_id, message}, state) do
+    encoded_msg = Messages.encode(message)
+    new_state = do_send_message(to_node_id, encoded_msg, state)
+    {:noreply, new_state}
   end
 
-  def handle_call({:submit_command, command}, from, state) do
-    case state.role_handler.handle_client_command(command, state.server_state, state.role_state) do
-      {:ok, new_server_state, new_role_state, messages} when is_list(messages) ->
-        # Handle multiple messages to be broadcast (common for leader)
-        new_state = broadcast_messages(messages, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        })
-        {:reply, :ok, new_state}
+  def handle_cast({:broadcast_multiple, messages}, state) do
+    new_state = Enum.reduce(messages, state, fn {peer_id, message}, acc_state ->
+      encoded_msg = Messages.encode(message)
+      do_send_message(peer_id, encoded_msg, acc_state)
+    end)
 
-      {:ok, new_server_state, new_role_state, message} ->
-        # Handle single message to be sent
-        new_state = broadcast_message(message, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        })
-        {:reply, :ok, new_state}
+    {:noreply, new_state}
+  end
 
-      {:ok, new_server_state, new_role_state} ->
-        # No messages to send
-        {:reply, :ok, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        }}
-
-      {:redirect, leader_id} ->
-        {:reply, {:error, {:redirect, leader_id}}, state}
-
+  def handle_cast({:connect_peer, node_id, address}, state) do
+    case TcpTransport.connect(state.transport, node_id, address, []) do
+      {:ok, _} ->
+        new_state = %{state |
+          connection_status: Map.put(state.connection_status, node_id, :connected)
+        }
+        retry_pending_messages(node_id, new_state)
+        {:noreply, new_state}
       {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  @impl true
-  def handle_cast({:received_message, from_node, message_binary}, state) do
-    case Messages.decode(message_binary) do
-      {:ok, message} ->
-        handle_decoded_message(message, from_node, state)
-      {:error, reason} ->
-        Logger.error("Failed to decode message: #{inspect(reason)}")
+        Logger.warn("Failed to connect to peer #{node_id}: #{inspect(reason)}")
         {:noreply, state}
     end
   end
 
+  def handle_cast({:disconnect_peer, node_id}, state) do
+    TcpTransport.close_connection(state.transport, node_id)
+    new_state = %{state |
+      connection_status: Map.put(state.connection_status, node_id, :disconnected)
+    }
+    {:noreply, new_state}
+  end
+
   @impl true
-  def handle_info({:timeout, type}, state) do
-    case state.role_handler.handle_timeout(type, state.server_state, state.role_state) do
-      {:ok, new_server_state, new_role_state} ->
-        {:noreply, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        }}
+  def handle_call({:get_connection_status, node_id}, _from, state) do
+    status = Map.get(state.connection_status, node_id, :disconnected)
+    {:reply, status, state}
+  end
 
-      {:ok, new_server_state, new_role_state, message} ->
-        new_state = broadcast_message(message, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        })
+  @impl true
+  def handle_info({:retry_message, ref}, state) do
+    case find_pending_message(ref, state) do
+      {node_id, message} ->
+        new_state = handle_retry(node_id, message, ref, state)
         {:noreply, new_state}
-
-      {:transition, new_role, new_server_state} ->
-        case handle_role_transition(new_role, new_server_state, state) do
-          {:ok, new_state} -> {:noreply, new_state}
-          {:error, reason} ->
-            Logger.error("Failed to handle timeout transition: #{inspect(reason)}")
-            {:noreply, state}
-        end
+      nil ->
+        {:noreply, cleanup_retry_timer(ref, state)}
     end
   end
 
-  def handle_info({:broadcast_complete, ref}, state) do
-    # Remove completed broadcast from pending responses
-    {:noreply, %{state | pending_responses: Map.delete(state.pending_responses, ref)}}
-  end
+  def handle_info({:connection_status_changed, node_id, status}, state) do
+    new_state = %{state |
+      connection_status: Map.put(state.connection_status, node_id, status)
+    }
 
-  def handle_info({:broadcast_failed, ref, reason}, state) do
-    Logger.error("Broadcast failed: #{inspect(reason)}")
-    {:noreply, %{state | pending_responses: Map.delete(state.pending_responses, ref)}}
+    case status do
+      :connected -> retry_pending_messages(node_id, new_state)
+      :disconnected -> queue_pending_messages(node_id, new_state)
+    end
+
+    {:noreply, new_state}
   end
 
   # Private Functions
 
   defp init_state(opts) do
-    with {:ok, node_id} <- validate_node_id(opts),
-         {:ok, state_store} <- validate_store(opts, :state_store),
-         {:ok, log_store} <- validate_store(opts, :log_store),
-         {:ok, server_state} <- initialize_server_state(node_id),
-         {:ok, role_state} <- initialize_role_state(:follower, server_state),
-         peers <- load_peer_configuration() do
-
-      {:ok, %State{
+    with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
+         {:ok, transport} <- Keyword.fetch(opts, :transport),
+         {:ok, server} <- Keyword.fetch(opts, :server),
+         {:ok, server_name} <- Keyword.fetch(opts, :server_name) do
+      state = %State{
         node_id: node_id,
-        server_state: server_state,
-        current_role: :follower,
-        role_state: role_state,
-        role_handler: Follower,
-        state_store: state_store,
-        log_store: log_store,
-        peers: peers
-      }}
+        transport: transport,
+        server: server,
+        server_name: server_name
+      }
+      {:ok, state}
+    else
+      :error -> {:error, :missing_required_options}
     end
   end
 
-  defp init_transport(state) do
-    transport_opts = [
-      node_id: state.node_id,
-      name: Module.concat(__MODULE__, "Transport_#{state.node_id}"),
-      message_handler: &handle_transport_message/3
-    ]
-    TcpTransport.start_link(transport_opts)
-  end
-
-  defp start_peer_connections(state) do
-    Enum.each(state.peers, fn peer_id ->
-      case get_peer_address(peer_id) do
-        {:ok, address} -> TcpTransport.connect(state.transport, peer_id, address, [])
-        _ -> :ok
-      end
-    end)
+  defp setup_transport_handler(state) do
+    TcpTransport.register_message_handler(state.transport, &handle_network_message/2)
     :ok
   end
 
-  defp handle_decoded_message(message, from_node, state) do
-    case dispatch_message(message, from_node, state) do
-      {:ok, new_state, response} when not is_nil(response) ->
-        send_response(state.transport, from_node, response)
-        {:noreply, new_state}
+  defp do_send_message(to_node_id, encoded_msg, state) do
+    case TcpTransport.send(state.transport, to_node_id, encoded_msg) do
+      :ok -> state
+      {:error, _reason} -> queue_message(to_node_id, encoded_msg, state)
+    end
+  end
 
-      {:ok, new_state} ->
-        {:noreply, new_state}
+  defp queue_message(node_id, message, state) do
+    ref = make_ref()
+    timer_ref = schedule_retry(ref)
 
-      {:transition, new_role, new_server_state} ->
-        case handle_role_transition(new_role, new_server_state, state) do
-          {:ok, final_state} -> {:noreply, final_state}
-          {:error, reason} ->
-            Logger.error("Failed to handle message transition: #{inspect(reason)}")
-            {:noreply, state}
+    new_pending = Map.update(
+      state.pending_messages,
+      node_id,
+      [{ref, message}],
+      &[{ref, message} | &1]
+    )
+
+    %{state |
+      pending_messages: new_pending,
+      retry_timers: Map.put(state.retry_timers, ref, timer_ref),
+      retry_count: Map.put(state.retry_count, ref, 0)
+    }
+  end
+
+  defp handle_retry(node_id, message, ref, state) do
+    retry_count = Map.get(state.retry_count, ref, 0)
+
+    if retry_count < @max_retries do
+      case TcpTransport.send(state.transport, node_id, message) do
+        :ok -> cleanup_retry_state(ref, node_id, state)
+        {:error, _} -> schedule_next_retry(node_id, message, ref, retry_count + 1, state)
+      end
+    else
+      Logger.warn("Max retries reached for message to #{node_id}")
+      cleanup_retry_state(ref, node_id, state)
+    end
+  end
+
+  defp schedule_retry(ref) do
+    Process.send_after(self(), {:retry_message, ref}, @retry_interval)
+  end
+
+  defp schedule_next_retry(node_id, message, ref, retry_count, state) do
+    timer_ref = schedule_retry(ref)
+
+    %{state |
+      retry_timers: Map.put(state.retry_timers, ref, timer_ref),
+      retry_count: Map.put(state.retry_count, ref, retry_count)
+    }
+  end
+
+  defp cleanup_retry_state(ref, node_id, state) do
+    %{state |
+      pending_messages: remove_pending_message(node_id, ref, state.pending_messages),
+      retry_timers: Map.delete(state.retry_timers, ref),
+      retry_count: Map.delete(state.retry_count, ref)
+    }
+  end
+
+  defp cleanup_retry_timer(ref, state) do
+    %{state | retry_timers: Map.delete(state.retry_timers, ref)}
+  end
+
+  defp find_pending_message(ref, state) do
+    Enum.find_value(state.pending_messages, fn {node_id, messages} ->
+      case Enum.find(messages, fn {msg_ref, _} -> msg_ref == ref end) do
+        {^ref, message} -> {node_id, message}
+        nil -> nil
+      end
+    end)
+  end
+
+  defp remove_pending_message(node_id, ref, pending_messages) do
+    case Map.get(pending_messages, node_id) do
+      nil ->
+        pending_messages
+      messages ->
+        new_messages = Enum.reject(messages, fn {msg_ref, _} -> msg_ref == ref end)
+        if Enum.empty?(new_messages) do
+          Map.delete(pending_messages, node_id)
+        else
+          Map.put(pending_messages, node_id, new_messages)
         end
     end
   end
 
-  defp send_response(transport, to_node, response) do
-    case Messages.encode(response) do
-      {:ok, encoded} ->
-        TcpTransport.send(transport, to_node, encoded)
+  defp retry_pending_messages(node_id, state) do
+    case Map.get(state.pending_messages, node_id) do
+      nil ->
+        state
+      messages ->
+        Enum.reduce(messages, state, fn {ref, message}, acc_state ->
+          case TcpTransport.send(state.transport, node_id, message) do
+            :ok -> cleanup_retry_state(ref, node_id, acc_state)
+            {:error, _} -> acc_state
+          end
+        end)
+    end
+  end
+
+  defp queue_pending_messages(node_id, state) do
+    state
+  end
+
+  defp handle_network_message(from_node_id, message_binary) do
+    case Messages.decode(message_binary) do
+      {:ok, decoded_msg} ->
+        GenServer.cast(self(), {:forward_to_server, from_node_id, decoded_msg})
       {:error, reason} ->
-        Logger.error("Failed to encode response: #{inspect(reason)}")
-        {:error, reason}
+        Logger.error("Failed to decode message from #{from_node_id}: #{inspect(reason)}")
     end
-  end
-
-
-
-  defp dispatch_message(message, from_node, state) do
-    handler_function = get_message_handler(message)
-    case apply(state.role_handler, handler_function, [message, state.server_state, state.role_state]) do
-      {:ok, new_server_state, new_role_state} ->
-        {:ok, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        }}
-
-      {:ok, new_server_state, new_role_state, response} ->
-        {:ok, %{state |
-          server_state: new_server_state,
-          role_state: new_role_state
-        }, response}
-
-      {:transition, new_role, new_server_state} ->
-        {:transition, new_role, new_server_state}
-    end
-  end
-
-  defp handle_role_transition(new_role, server_state, state) do
-    with {:ok, term_state} <- maybe_increment_term(new_role, server_state),
-         :ok <- persist_term(term_state.current_term, state),
-         {:ok, role_state} <- initialize_role_state(new_role, term_state) do
-
-      Logger.info("Role transition",
-        from: state.current_role,
-        to: new_role,
-        term: term_state.current_term
-      )
-
-      # Handle any initial messages from the new role (e.g., vote requests from candidate)
-      case role_state do
-        {role_state_data, message} ->
-          new_state = %{state |
-            current_role: new_role,
-            role_handler: get_role_handler(new_role),
-            role_state: role_state_data,
-            server_state: term_state
-          }
-          broadcast_message(message, new_state)
-          {:ok, new_state}
-
-        role_state_data ->
-          {:ok, %{state |
-            current_role: new_role,
-            role_handler: get_role_handler(new_role),
-            role_state: role_state_data,
-            server_state: term_state
-          }}
-      end
-    end
-  end
-
-  defp broadcast_message({:broadcast, message}, state) do
-    Enum.each(state.peers, fn peer_id ->
-      send_message(state.transport, peer_id, message)
-    end)
-    state
-  end
-
-  defp broadcast_message({:broadcast_multiple, messages}, state) do
-    Enum.each(messages, fn {peer_id, message} ->
-      send_message(state.transport, peer_id, message)
-    end)
-    state
-  end
-
-  defp broadcast_message({:send, to_node, message}, state) do
-    send_message(state.transport, to_node, message)
-    state
-  end
-
-  defp broadcast_message(nil, state), do: state
-
-  defp broadcast_messages(messages, state) do
-    Enum.reduce(messages, state, &broadcast_message(&1, &2))
-  end
-
-  defp send_message(transport, to_node, message) do
-    case Messages.encode(message) do
-      {:ok, encoded} ->
-        TcpTransport.send(transport, to_node, encoded)
-      {:error, reason} ->
-        Logger.error("Failed to encode message: #{inspect(reason)}")
-        {:error, reason}
-    end
-  end
-
-  defp get_message_handler(%Messages.AppendEntries{}), do: :handle_append_entries
-  defp get_message_handler(%Messages.AppendEntriesResponse{}), do: :handle_append_entries_response
-  defp get_message_handler(%Messages.RequestVote{}), do: :handle_request_vote
-  defp get_message_handler(%Messages.RequestVoteResponse{}), do: :handle_request_vote_response
-
-  defp get_role_handler(:follower), do: Follower
-  defp get_role_handler(:candidate), do: Candidate
-  defp get_role_handler(:leader), do: Leader
-
-  defp maybe_increment_term(:candidate, server_state) do
-    {:ok, %{server_state | current_term: Term.increment(server_state.current_term)}}
-  end
-  defp maybe_increment_term(_role, server_state), do: {:ok, server_state}
-
-  defp persist_term(term, state) do
-    StateStore.save_term(state.state_store, term)
-  end
-
-  defp initialize_role_state(role, server_state) do
-    role_handler = get_role_handler(role)
-    role_handler.init(server_state)
-  end
-
-  defp validate_node_id(opts) do
-    with {:ok, node_id} <- Keyword.fetch(opts, :node_id),
-         {:ok, validated_id} <- NodeId.validate(node_id) do
-      {:ok, validated_id}
-    else
-      :error -> {:error, :missing_node_id}
-      error -> error
-    end
-  end
-
-  defp validate_store(opts, key) do
-    case Keyword.fetch(opts, key) do
-      {:ok, store} -> {:ok, store}
-      :error -> {:error, "Missing #{key}"}
-    end
-  end
-
-  defp initialize_server_state(node_id) do
-    {:ok, ServerState.new(node_id)}
-  end
-
-  defp load_peer_configuration do
-    peers = Application.get_env(:elixir_raft, :peers, %{})
-    MapSet.new(Map.keys(peers))
-  end
-
-  defp get_peer_address(peer_id) do
-    peers = Application.get_env(:elixir_raft, :peers, %{})
-    case Map.get(peers, peer_id) do
-      nil -> {:error, :peer_not_found}
-      address -> {:ok, address}
-    end
-  end
-
-  defp name_from_opts(opts) do
-    case Keyword.get(opts, :name) do
-      nil -> __MODULE__
-      name -> name
-    end
-  end
-
-  defp handle_transport_message(from_node, message_binary, dispatcher_pid) do
-    GenServer.cast(dispatcher_pid, {:received_message, from_node, message_binary})
   end
 end

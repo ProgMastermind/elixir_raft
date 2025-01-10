@@ -1,269 +1,261 @@
-defmodule ElixirRaft.Consensus.MessageDispatcherTest do
+defmodule ElixirRaft.MessageDispatcherTest do
   use ExUnit.Case, async: true
   require Logger
 
-  alias ElixirRaft.Consensus.MessageDispatcher
-  alias ElixirRaft.Core.{ServerState, NodeId, Term}
-  alias ElixirRaft.RPC.Messages
-  alias ElixirRaft.Storage.{StateStore, LogStore}
+  alias ElixirRaft.MessageDispatcher
   alias ElixirRaft.Network.TcpTransport
+  alias ElixirRaft.RPC.Messages
+  alias ElixirRaft.RPC.Messages.{RequestVote, AppendEntries}
+  alias ElixirRaft.Core.NodeId
 
-  @moduletag :capture_log
+  defmodule MockTransport do
+    use GenServer
 
-  # Generate static UUIDs for consistent testing
-  @node1_id "550e8400-e29b-41d4-a716-446655440000"
-  @node2_id "550e8400-e29b-41d4-a716-446655440001"
-  @node3_id "550e8400-e29b-41d4-a716-446655440002"
+    def start_link(opts) do
+      GenServer.start_link(__MODULE__, opts, name: opts[:name])
+    end
+
+    def init(opts) do
+      {:ok, %{
+        test_pid: opts[:test_pid],
+        node_id: opts[:node_id],
+        connection_status: %{},
+        message_handler: nil
+      }}
+    end
+
+    # Client API implementations
+    def send(server, node_id, message) do
+      GenServer.call(server, {:send, node_id, message})
+    end
+
+    def connect(server, node_id, address, opts) do
+      GenServer.call(server, {:connect, node_id, address, opts})
+    end
+
+    def close_connection(server, node_id) do
+      GenServer.call(server, {:close_connection, node_id})
+    end
+
+    def register_message_handler(server, handler) do
+      GenServer.call(server, {:register_handler, handler})
+    end
+
+    def get_local_address(server) do
+      GenServer.call(server, :get_local_address)
+    end
+
+    # Server callbacks
+    def handle_call({:send, node_id, message}, _from, state) do
+      case get_in(state.connection_status, [node_id]) do
+        :connected ->
+          send(state.test_pid, {:transport_send, node_id, message})
+          {:reply, :ok, state}
+        _ ->
+          {:reply, {:error, :not_connected}, state}
+      end
+    end
+
+    def handle_call({:connect, node_id, _address, _opts}, _from, state) do
+      new_state = put_in(state.connection_status[node_id], :connected)
+      send(state.test_pid, {:transport_connect, node_id})
+      {:reply, {:ok, :fake_socket}, new_state}
+    end
+
+    def handle_call({:close_connection, node_id}, _from, state) do
+      new_state = put_in(state.connection_status[node_id], :disconnected)
+      send(state.test_pid, {:transport_disconnect, node_id})
+      {:reply, :ok, new_state}
+    end
+
+    def handle_call({:register_handler, handler}, _from, state) do
+      {:reply, :ok, %{state | message_handler: handler}}
+    end
+
+    def handle_call(:get_local_address, _from, state) do
+      {:reply, {:ok, {{127, 0, 0, 1}, 9000}}, state}
+    end
+
+    # Handle cast messages
+    def handle_cast({:close_connection, node_id}, state) do
+      new_state = put_in(state.connection_status[node_id], :disconnected)
+      send(state.test_pid, {:transport_disconnect, node_id})
+      {:noreply, new_state}
+    end
+
+    def handle_cast(_msg, state) do
+      {:noreply, state}
+    end
+  end
 
   setup do
-    # Create temporary directory for test storage
-    test_dir = System.tmp_dir!() |> Path.join("elixir_raft_test_#{:rand.uniform(1000)}")
-    File.mkdir_p!(test_dir)
+    # Generate unique names for each test
+    node_id = UUID.uuid4()
+    peer_id = UUID.uuid4()
+    transport_name = String.to_atom("transport_#{UUID.uuid4()}")
+    server_name = String.to_atom("server_#{UUID.uuid4()}")
+    dispatcher_name = String.to_atom("dispatcher_#{UUID.uuid4()}")
 
-    # Start TCP transport for test nodes
-    {:ok, transport1} = start_supervised({TcpTransport, [
-      node_id: @node1_id,
-      name: :"Transport1_#{:rand.uniform(1000)}"
-    ]})
-    {:ok, transport2} = start_supervised({TcpTransport, [
-      node_id: @node2_id,
-      name: :"Transport2_#{:rand.uniform(1000)}"
-    ]})
-    {:ok, transport3} = start_supervised({TcpTransport, [
-      node_id: @node3_id,
-      name: :"Transport3_#{:rand.uniform(1000)}"
-    ]})
+    test_pid = self()
 
-    # Start listening on random ports
-    {:ok, {_addr1, port1}} = TcpTransport.listen(transport1, [])
-    {:ok, {_addr2, port2}} = TcpTransport.listen(transport2, [])
-    {:ok, {_addr3, port3}} = TcpTransport.listen(transport3, [])
+    # Start mock transport
+    {:ok, transport} = MockTransport.start_link([
+      node_id: node_id,
+      name: transport_name,
+      test_pid: test_pid
+    ])
 
-    # Configure test peers with actual ports
-    peers = %{
-      @node2_id => {{127, 0, 0, 1}, port2},
-      @node3_id => {{127, 0, 0, 1}, port3}
-    }
-    Application.put_env(:elixir_raft, :peers, peers)
+    # Start test server process
+    server = spawn_link(fn -> test_server_loop(test_pid) end)
 
-    # Start the stores
-    {:ok, state_store} = start_supervised({StateStore, [
-      node_id: @node1_id,
-      data_dir: test_dir,
-      name: :"StateStore_#{:rand.uniform(1000)}"
-    ]})
-
-    {:ok, log_store} = start_supervised({LogStore, [
-      data_dir: test_dir,
-      name: :"LogStore_#{:rand.uniform(1000)}"
-    ]})
-
-    # Start the dispatcher
-    {:ok, dispatcher} = start_supervised({MessageDispatcher, [
-      node_id: @node1_id,
-      state_store: state_store,
-      log_store: log_store,
-      name: :"Dispatcher_#{:rand.uniform(1000)}"
-    ]})
+    # Start MessageDispatcher
+    {:ok, dispatcher} = MessageDispatcher.start_link([
+      node_id: node_id,
+      transport: transport_name,
+      server: server,
+      server_name: server_name,
+      name: dispatcher_name
+    ])
 
     on_exit(fn ->
-      File.rm_rf!(test_dir)
+      if Process.alive?(dispatcher) do
+        Process.exit(dispatcher, :normal)
+      end
+      if Process.alive?(transport) do
+        Process.exit(transport, :normal)
+      end
     end)
 
     %{
       dispatcher: dispatcher,
-      state_store: state_store,
-      log_store: log_store,
-      transport1: transport1,
-      transport2: transport2,
-      transport3: transport3,
-      ports: %{node1: port1, node2: port2, node3: port3},
-      test_dir: test_dir
+      dispatcher_name: dispatcher_name,
+      transport: transport,
+      transport_name: transport_name,
+      server: server,
+      test_pid: test_pid,
+      node_id: node_id,
+      peer_id: peer_id
     }
   end
 
-  describe "network initialization" do
-    test "establishes connections with peers", %{dispatcher: dispatcher, ports: ports} do
-      # Give some time for connections to establish
-      Process.sleep(200)
+  describe "initialization" do
+    test "starts successfully with valid options" do
+      node_id = UUID.uuid4()
+      transport_name = String.to_atom("transport_#{UUID.uuid4()}")
+      server_name = String.to_atom("server_#{UUID.uuid4()}")
+      dispatcher_name = String.to_atom("dispatcher_#{UUID.uuid4()}")
 
-      # Verify connections are established
-      {:ok, server_state} = MessageDispatcher.get_server_state(dispatcher)
-      assert server_state.node_id == @node1_id
-
-      # Check TCP transport status
-      assert_receive {:tcp_connected, @node2_id}, 1000
-      assert_receive {:tcp_connected, @node3_id}, 1000
-    end
-
-    test "handles peer disconnection and reconnection", %{dispatcher: dispatcher, transport2: transport2} do
-      Process.sleep(200) # Wait for initial connections
-
-      # Simulate peer disconnect
-      TcpTransport.stop(transport2)
-      Process.sleep(100)
-
-      # Start new transport for node2
-      {:ok, new_transport2} = TcpTransport.start_link([
-        node_id: @node2_id,
-        name: :"Transport2_New_#{:rand.uniform(1000)}"
+      {:ok, transport} = MockTransport.start_link([
+        node_id: node_id,
+        name: transport_name,
+        test_pid: self()
       ])
 
-      # Should reconnect automatically
-      Process.sleep(200)
-      assert_receive {:tcp_connected, @node2_id}, 1000
+      assert {:ok, pid} = MessageDispatcher.start_link([
+        node_id: node_id,
+        transport: transport_name,
+        server: self(),
+        server_name: server_name,
+        name: dispatcher_name
+      ])
+
+      assert Process.alive?(pid)
+
+      # Cleanup
+      Process.exit(pid, :normal)
+      Process.exit(transport, :normal)
+    end
+
+    test "fails to start with missing options" do
+      assert {:error, _} = MessageDispatcher.start_link([])
     end
   end
 
-  describe "network message transmission" do
-    test "successfully broadcasts append entries to all peers", %{dispatcher: dispatcher} do
-      # Force leader state
-      force_leader_state(dispatcher)
-      Process.sleep(100)
+  describe "message sending" do
+    test "sends message to specific peer", context do
+      %{dispatcher: dispatcher, peer_id: peer_id, node_id: node_id} = context
 
-      # Submit a command which should trigger append entries
-      :ok = MessageDispatcher.submit_command(dispatcher, "test_command")
+      # First connect the peer
+      MessageDispatcher.connect_peer(dispatcher, {peer_id, {"127.0.0.1", 9000}})
+      Process.sleep(50)
 
-      # Verify append entries messages are sent to both peers
-      assert_receive {:append_entries_sent, @node2_id}, 1000
-      assert_receive {:append_entries_sent, @node3_id}, 1000
+      message = AppendEntries.new(1, node_id, 0, 0, [], 0)
+      MessageDispatcher.send_message(dispatcher, peer_id, message)
+
+      assert_receive {:transport_send, ^peer_id, sent_message}
+      {:ok, decoded} = Messages.decode(sent_message)
+      assert decoded.term == 1
+      assert decoded.leader_id == node_id
     end
 
-    test "handles request vote responses over network", %{dispatcher: dispatcher} do
-      # Trigger election
-      send(dispatcher, {:timeout, :election})
-      Process.sleep(100)
+    test "handles broadcast_multiple", context do
+      %{dispatcher: dispatcher, peer_id: peer_id, node_id: node_id} = context
 
-      # Verify request vote messages are sent
-      assert_receive {:request_vote_sent, @node2_id}, 1000
-      assert_receive {:request_vote_sent, @node3_id}, 1000
+      # First connect the peer
+      MessageDispatcher.connect_peer(dispatcher, {peer_id, {"127.0.0.1", 9000}})
+      Process.sleep(50)
 
-      # Simulate responses
-      response1 = %Messages.RequestVoteResponse{
-             term: 1,
-             vote_granted: true,
-             voter_id: @node2_id
-           }
+      messages = [
+        {peer_id, RequestVote.new(1, node_id, 0, 0)},
+        {peer_id, AppendEntries.new(1, node_id, 0, 0, [], 0)}
+      ]
 
-           response2 = %Messages.RequestVoteResponse{
-             term: 1,
-             vote_granted: true,
-             voter_id: @node3_id
-           }
+      MessageDispatcher.broadcast_multiple(dispatcher, messages)
 
-           send_message_from_peer(@node2_id, response1, dispatcher)
-           send_message_from_peer(@node3_id, response2, dispatcher)
+      assert_receive {:transport_send, ^peer_id, message1}
+      assert_receive {:transport_send, ^peer_id, message2}
 
-      # Should become leader after receiving majority
-      Process.sleep(100)
-      assert {:ok, :leader} = MessageDispatcher.get_current_role(dispatcher)
-    end
+      {:ok, decoded1} = Messages.decode(message1)
+      {:ok, decoded2} = Messages.decode(message2)
 
-    test "handles network partitions", %{dispatcher: dispatcher, transport2: transport2, transport3: transport3} do
-      # Simulate network partition by stopping peer transports
-      TcpTransport.stop(transport2)
-      TcpTransport.stop(transport3)
-      Process.sleep(100)
-
-      # Should step down as leader if was leader
-      force_leader_state(dispatcher)
-      Process.sleep(500) # Wait for heartbeat timeout
-
-      # Should revert to follower due to lack of peer communication
-      assert {:ok, :follower} = MessageDispatcher.get_current_role(dispatcher)
+      assert decoded1.term == 1
+      assert decoded2.term == 1
     end
   end
 
-  describe "message replication" do
-    test "replicates entries to peers", %{dispatcher: dispatcher} do
-      force_leader_state(dispatcher)
-      Process.sleep(100)
+  describe "connection management" do
+    test "tracks connection status", context do
+      %{dispatcher: dispatcher, peer_id: peer_id} = context
 
-      # Submit multiple commands
-      commands = ["cmd1", "cmd2", "cmd3"]
-      Enum.each(commands, fn cmd ->
-        :ok = MessageDispatcher.submit_command(dispatcher, cmd)
-      end)
+      # Initially disconnected
+      assert :disconnected == MessageDispatcher.get_connection_status(dispatcher, peer_id)
 
-      # Verify append entries are sent with correct entries
-      Enum.each(1..3, fn _ ->
-        assert_receive {:append_entries_sent, @node2_id}, 1000
-        assert_receive {:append_entries_sent, @node3_id}, 1000
-      end)
-    end
+      # Connect peer
+      MessageDispatcher.connect_peer(dispatcher, {peer_id, {"127.0.0.1", 9000}})
+      Process.sleep(50)
+      assert :connected == MessageDispatcher.get_connection_status(dispatcher, peer_id)
 
-    test "handles partial replication success", %{dispatcher: dispatcher} do
-      force_leader_state(dispatcher)
-      Process.sleep(100)
-
-      # Submit command
-      :ok = MessageDispatcher.submit_command(dispatcher, "test_command")
-
-      # Simulate success from one peer, failure from another
-      success_response = %Messages.AppendEntriesResponse{
-        term: 1,
-        success: true,
-        match_index: 1
-      }
-
-      failure_response = %Messages.AppendEntriesResponse{
-        term: 1,
-        success: false,
-        match_index: 0
-      }
-
-      send_message_from_peer(@node2_id, success_response, dispatcher)
-      send_message_from_peer(@node3_id, failure_response, dispatcher)
-
-      # Should retry replication to failed peer
-      assert_receive {:append_entries_sent, @node3_id}, 1000
+      # Disconnect peer
+      MessageDispatcher.disconnect_peer(dispatcher, peer_id)
+      Process.sleep(50)
+      assert :disconnected == MessageDispatcher.get_connection_status(dispatcher, peer_id)
     end
   end
 
-  # Helper functions
+  describe "message retries" do
+    test "queues messages when disconnected", context do
+      %{dispatcher: dispatcher, peer_id: peer_id, node_id: node_id} = context
 
-  defp force_leader_state(dispatcher) do
-    send(dispatcher, {:timeout, :election})
-        Process.sleep(50)
+      message = RequestVote.new(1, node_id, 0, 0)
+      MessageDispatcher.send_message(dispatcher, peer_id, message)
 
-        response = %Messages.RequestVoteResponse{
-          term: 1,
-          vote_granted: true,
-          voter_id: @node2_id  # Added required voter_id field
-        }
+      # Message should not be sent because peer is disconnected
+      refute_receive {:transport_send, _, _}, 100
 
-        Enum.each([@node2_id, @node3_id], fn node_id ->
-          # Create a response with the correct voter_id for each node
-          node_response = %Messages.RequestVoteResponse{
-            term: 1,
-            vote_granted: true,
-            voter_id: node_id
-          }
-          send_message_from_peer(node_id, node_response, dispatcher)
-        end)
+      # Connect the peer
+      MessageDispatcher.connect_peer(dispatcher, {peer_id, {"127.0.0.1", 9000}})
+      Process.sleep(50)
 
-        Process.sleep(100)
+      # Should now receive the queued message
+      assert_receive {:transport_send, ^peer_id, _message}, 1000
+    end
   end
 
-  defp send_message_from_peer(from_node_id, message, dispatcher) do
-    {:ok, encoded} = Messages.encode(message)
-    GenServer.cast(dispatcher, {:received_message, from_node_id, encoded})
-  end
-
-  # Mock transport message handlers
-  def handle_transport_message(from_node_id, message_binary, test_pid) do
-    try do
-      message = Messages.decode!(message_binary)
-      case message do
-        %Messages.AppendEntries{} ->
-          send(test_pid, {:append_entries_sent, from_node_id})
-        %Messages.RequestVote{} ->
-          send(test_pid, {:request_vote_sent, from_node_id})
-        _ ->
-          send(test_pid, {:message_sent, from_node_id, message})
-      end
-    rescue
-      _ -> :ok
+  defp test_server_loop(test_pid) do
+    receive do
+      msg ->
+        send(test_pid, {:server_received, msg})
+        test_server_loop(test_pid)
     end
   end
 end
